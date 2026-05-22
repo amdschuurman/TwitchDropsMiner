@@ -120,6 +120,25 @@ socket.on('disconnect', () => {
     document.getElementById('connection-indicator').className = 'disconnected';
 });
 
+// If the Socket.IO handshake is rejected with "Authentication required" the
+// browser is missing the tdm_session cookie. Show a prominent banner so the
+// user knows to open the bootstrap URL printed in the server logs.
+socket.on('connect_error', (err) => {
+    const msg = (err && err.message) || '';
+    if (!msg.toLowerCase().includes('authentication')) return;
+    if (document.getElementById('tdm-auth-banner')) return;
+    const banner = document.createElement('div');
+    banner.id = 'tdm-auth-banner';
+    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#b00020;color:#fff;padding:12px 16px;font-family:system-ui,sans-serif;text-align:center;box-shadow:0 2px 4px rgba(0,0,0,0.3);';
+    const strong = document.createElement('strong');
+    strong.textContent = 'Authentication required. ';
+    const span = document.createElement('span');
+    span.textContent = 'Open the bootstrap URL printed in the server logs (look for "Bootstrap URL:" under docker logs twitch-drops-miner). This installs a session cookie for this browser.';
+    banner.appendChild(strong);
+    banner.appendChild(span);
+    document.body.appendChild(banner);
+});
+
 socket.on('initial_state', (data) => {
     console.log('Received initial state', data);
     if (data.status) updateStatus(data.status);
@@ -1806,7 +1825,7 @@ function applyTranslations(t) {
                 makeElement('h3', { id: 'help-notes-header' }, t.gui.help.important_notes || 'Important Notes'),
                 makeHelpList('ul', notesItems),
                 makeElement('div', { class: 'help-links' }, '', el =>
-                    el.appendChild(makeElement('a', { href: 'https://github.com/rangermix/TwitchDropsMiner', target: '_blank', rel: 'noopener noreferrer' }, t.gui.help.github_repo || 'GitHub Repository'))
+                    el.appendChild(makeElement('a', { href: 'https://github.com/amdschuurman/TwitchDropsMiner', target: '_blank', rel: 'noopener noreferrer' }, t.gui.help.github_repo || 'GitHub Repository'))
                 ),
             );
         }

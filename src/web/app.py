@@ -203,6 +203,9 @@ async def serve_index(request: Request):
             httponly=True,
             samesite="lax",
         )
+    # Never cache the HTML shell — asset references inside use cache-busted
+    # query strings, so the index itself must always be fresh.
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     return response
 
 
@@ -330,7 +333,10 @@ async def get_settings(_token: str = Depends(require_auth)):
 
 
 @app.get("/api/languages")
-async def get_languages(_token: str = Depends(require_auth)):
+async def get_languages():
+    # Public: language list is static metadata, no authentication required.
+    # Frontend fetches this before the bootstrap cookie is installed so the
+    # language picker can render on the very first page load.
     """Get available languages"""
     if not gui_manager:
         raise HTTPException(status_code=503, detail="GUI not initialized")
@@ -339,7 +345,10 @@ async def get_languages(_token: str = Depends(require_auth)):
 
 
 @app.get("/api/translations")
-async def get_translations(_token: str = Depends(require_auth)):
+async def get_translations():
+    # Public: translation bundles are static UI strings, identical to what ships
+    # in the repo. Keeping auth on them would block the very first render before
+    # the bootstrap cookie is installed and cause the UI to look broken.
     """Get translations for current language"""
     from src.i18n.translator import _
 
@@ -424,7 +433,9 @@ def _is_newer_version(candidate: str, current: str) -> bool:
 
 
 @app.get("/api/version")
-async def get_version(_token: str = Depends(require_auth)):
+async def get_version():
+    # Public: just the installed version + GitHub release lookup. Useful to
+    # show in the footer before the user authenticates.
     """Get current application version and check for updates"""
     import aiohttp
 
@@ -440,7 +451,8 @@ async def get_version(_token: str = Depends(require_auth)):
         async with (
             aiohttp.ClientSession() as session,
             session.get(
-                "https://api.github.com/repos/rangermix/TwitchDropsMiner/releases/latest", timeout=5
+                "https://api.github.com/repos/amdschuurman/TwitchDropsMiner/releases/latest",
+                timeout=5,
             ) as response,
         ):
             if response.status == 200:
@@ -460,7 +472,7 @@ async def get_version(_token: str = Depends(require_auth)):
         "current_version": current_version,
         "latest_version": latest_version,
         "update_available": update_available,
-        "download_url": download_url or "https://github.com/rangermix/TwitchDropsMiner/releases",
+        "download_url": download_url or "https://github.com/amdschuurman/TwitchDropsMiner/releases",
     }
 
 

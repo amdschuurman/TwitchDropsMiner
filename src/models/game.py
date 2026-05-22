@@ -14,7 +14,7 @@ class Game:
 
     def __init__(self, data: JsonType):
         self.id: int = int(data["id"])
-        self.name: str = data.get("displayName") or data["name"]
+        self.name: str = data.get("displayName") or data.get("name") or f"Game {self.id}"
         if "slug" in data:
             self.slug = data["slug"]
         # Store box art URL if available (used for game icons in UI)

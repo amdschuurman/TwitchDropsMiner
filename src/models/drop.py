@@ -77,7 +77,13 @@ class BaseDrop:
     @property
     def preconditions_met(self) -> bool:
         campaign = self.campaign
-        return all(campaign.timed_drops[pid].is_claimed for pid in self.precondition_drops)
+        # A missing precondition ID means the campaign data is incomplete; treat the
+        # precondition as unmet rather than crashing the whole inventory parse.
+        for pid in self.precondition_drops:
+            predecessor = campaign.timed_drops.get(pid)
+            if predecessor is None or not predecessor.is_claimed:
+                return False
+        return True
 
     def _on_state_changed(self) -> None:
         raise NotImplementedError
@@ -201,9 +207,8 @@ class TimedDrop(BaseDrop):
         self, campaign: DropsCampaign, data: JsonType, claimed_benefits: dict[str, datetime]
     ):
         super().__init__(campaign, data, claimed_benefits)
-        self.real_current_minutes: int = (
-            data["self"]["currentMinutesWatched"] if "self" in data else 0
-        )
+        self_data: JsonType = data.get("self") or {}
+        self.real_current_minutes: int = self_data.get("currentMinutesWatched") or 0
         self.required_minutes: int = data["requiredMinutesWatched"]
         self.extra_current_minutes: int = 0
         if self.is_claimed:

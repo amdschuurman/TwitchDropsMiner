@@ -105,19 +105,21 @@ class DropsCampaign:
 
     @property
     def required_minutes(self) -> int:
-        return max(d.total_required_minutes for d in self.drops)
+        return max((d.total_required_minutes for d in self.drops), default=0)
 
     @property
     def remaining_minutes(self) -> int:
-        return max(d.total_remaining_minutes for d in self.drops)
+        return max((d.total_remaining_minutes for d in self.drops), default=0)
 
     @property
     def progress(self) -> float:
+        if self.total_drops == 0:
+            return 0.0
         return sum(d.progress for d in self.drops) / self.total_drops
 
     @property
     def availability(self) -> float:
-        return min(d.availability for d in self.drops)
+        return min((d.availability for d in self.drops), default=0.0)
 
     @property
     def first_drop(self) -> TimedDrop | None:

@@ -163,8 +163,12 @@ class Stream:
                     logger.error(f'Stream URL get error: "{available_json["error"]}"')
                     self.channel.set_offline()
                 return None
-            # pick the last URL from the list, usually with the lowest quality stream
-            self._stream_url = cast(URLType, URL(available_qualities.strip().split("\n")[-1]))
+            # pick the last non-empty URL from the list, usually with the lowest quality stream
+            url_lines = [line for line in available_qualities.splitlines() if line.strip()]
+            if not url_lines:
+                self.channel._twitch.print(available_qualities)
+                return None
+            self._stream_url = cast(URLType, URL(url_lines[-1]))
         except (aiohttp.InvalidURL, ValueError):
             self.channel._twitch.print(available_qualities)
             raise

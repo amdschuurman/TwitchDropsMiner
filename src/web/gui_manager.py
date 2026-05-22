@@ -54,8 +54,6 @@ class WebGUIManager:
         self.channels = ChannelListManager(self._broadcaster, self)
         self.inv = InventoryManager(self._broadcaster, ImageCache(self))
         self.login = LoginFormManager(self._broadcaster, self)
-        self.inv = InventoryManager(self._broadcaster, ImageCache(self))
-        self.login = LoginFormManager(self._broadcaster, self)
 
         # Callback to trigger game update when relevant settings change
         on_settings_change = self._twitch.get_change_state_callable(State.GAMES_UPDATE)

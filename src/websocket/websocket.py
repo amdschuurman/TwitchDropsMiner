@@ -307,7 +307,10 @@ class Websocket:
             WebsocketClosed: When the websocket connection closes
         """
         ws = self._ws.get_with_default(None)
-        assert ws is not None
+        if ws is None:
+            # Connection was cleared between handler entry and recv; treat as closed
+            # so the handler enters the reconnection path instead of crashing.
+            raise WebsocketClosed(received=False)
         while True:
             raw_message: aiohttp.WSMessage = await ws.receive(timeout=timeout)
             ws_logger.debug(f"Websocket[{self._idx}] received: {raw_message}")
@@ -402,9 +405,13 @@ class Websocket:
 
         Args:
             message: JSON-serializable message dict
+
+        Raises:
+            WebsocketClosed: If the connection was cleared before send.
         """
         ws = self._ws.get_with_default(None)
-        assert ws is not None
+        if ws is None:
+            raise WebsocketClosed(received=False)
         if message["type"] != "PING":
             message["nonce"] = create_nonce(CHARS_ASCII, 30)
         await ws.send_json(message, dumps=json_minify)

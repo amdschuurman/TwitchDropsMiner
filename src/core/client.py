@@ -252,8 +252,6 @@ class Twitch:
             if self._state is State.IDLE:
                 self.gui.status.update(_.t["gui"]["status"]["idle"])
                 self.stop_watching()
-                # clear the flag and wait until it's set again
-                self._state_change.clear()
             elif self._state is State.INVENTORY_FETCH:
                 # ensure the websocket is running
                 await self.websocket.start()
@@ -511,7 +509,6 @@ class Twitch:
                         active_drop := active_campaign.first_drop
                     ) is not None:
                         active_drop.display(countdown=False, subone=True)
-                    self._state_change.clear()
                 elif watching_channel is not None and self.can_watch(watching_channel):
                     # Continue watching current channel
                     if self.is_manual_mode() and self._manual_target_game:
@@ -521,7 +518,6 @@ class Twitch:
                             channel=watching_channel.name
                         )
                     self.gui.status.update(status_text)
-                    self._state_change.clear()
                 else:
                     # No channels available to watch
                     self.print(_.t["status"]["no_channel"])
@@ -530,7 +526,11 @@ class Twitch:
                 self.gui.status.update(_.t["gui"]["status"]["exiting"])
                 # we've been requested to exit the application
                 break
+            # Wait for the next state change. clear() runs after wait so any
+            # change_state() emitted during processing isn't lost. Each iteration
+            # snapshots the latest self._state at the top of the loop.
             await self._state_change.wait()
+            self._state_change.clear()
 
     def can_watch(self, channel: Channel) -> bool:
         """Delegate to WatchService."""

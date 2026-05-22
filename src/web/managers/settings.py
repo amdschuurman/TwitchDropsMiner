@@ -44,9 +44,17 @@ class SettingsManager:
         """Get current settings for display.
 
         Returns:
-            Dictionary containing all user-configurable settings
+            Dictionary containing all user-configurable settings, plus the
+            available-games list so the UI can render the games-to-watch
+            picker before the first ``games_available`` socket emit fires.
         """
         settings = vars(self._settings).copy()
+        # Always include the watch list so manually-added games persist in
+        # the dropdown across reloads even before the next inventory fetch
+        # has broadcast a ``games_available`` event.
+        from_watchlist = set(settings.get("games_to_watch") or [])
+        from_known = set(self._available_games)
+        settings["games_available"] = sorted(from_known | from_watchlist)
         return settings
 
     def get_languages(self) -> dict[str, Any]:
@@ -130,10 +138,17 @@ class SettingsManager:
     def set_games(self, games: set[Game]):
         """Update the list of available games for settings panel.
 
+        Includes:
+        - Games discovered from currently visible Twitch drop campaigns
+        - Every entry the user already has on their watch list (so manually-added
+          games like an unreleased War Thunder drop persist in the dropdown
+          across restarts, even before a matching Twitch campaign appears)
+
         Args:
             games: Set of Game objects discovered from campaigns
         """
-        # Store and broadcast available games for settings panel
-        game_names = sorted([g.name for g in games])
+        from_campaigns = {g.name for g in games}
+        from_watchlist = set(getattr(self._settings, "games_to_watch", []) or [])
+        game_names = sorted(from_campaigns | from_watchlist)
         self._available_games = game_names
         asyncio.create_task(self._broadcaster.emit("games_available", {"games": game_names}))

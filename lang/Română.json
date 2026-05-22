@@ -112,6 +112,7 @@
             "claimed_drops": "revendicat",
             "filters": {
                 "active": "Activ",
+                "linked": "Conectat",
                 "not_linked": "Neconectat",
                 "upcoming": "Viitor",
                 "expired": "Expirat",

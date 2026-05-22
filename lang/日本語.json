@@ -112,6 +112,7 @@
             "claimed_drops": "受け取り済み",
             "filters": {
                 "active": "アクティブ",
+                "linked": "連携済み",
                 "not_linked": "未連携",
                 "upcoming": "近日開催",
                 "expired": "期限切れ",

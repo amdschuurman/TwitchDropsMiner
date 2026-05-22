@@ -112,6 +112,7 @@
             "claimed_drops": "تم المطالبة",
             "filters": {
                 "active": "نشط",
+                "linked": "مرتبط",
                 "not_linked": "غير مرتبط",
                 "upcoming": "قادم",
                 "expired": "منتهي",

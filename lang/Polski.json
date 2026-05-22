@@ -112,6 +112,7 @@
             "claimed_drops": "odebrano",
             "filters": {
                 "active": "Aktywne",
+                "linked": "Połączone",
                 "not_linked": "Niepołączone",
                 "upcoming": "Nadchodzące",
                 "expired": "Wygasłe",

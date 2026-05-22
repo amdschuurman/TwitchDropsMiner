@@ -112,6 +112,7 @@
             "claimed_drops": "talep edildi",
             "filters": {
                 "active": "Aktif",
+                "linked": "Bağlı",
                 "not_linked": "Bağlı Değil",
                 "upcoming": "Yaklaşan",
                 "expired": "Süresi Dolmuş",

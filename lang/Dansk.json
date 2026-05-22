@@ -109,6 +109,7 @@
             "claimed_drops": "hentet",
             "filters": {
                 "active": "Aktiv",
+                "linked": "Forbundet",
                 "not_linked": "Ikke forbundet",
                 "upcoming": "Kommende",
                 "expired": "Udløbet",

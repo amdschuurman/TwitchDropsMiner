@@ -112,6 +112,7 @@
             "claimed_drops": "reivindicado",
             "filters": {
                 "active": "Ativo",
+                "linked": "Vinculado",
                 "not_linked": "Não Vinculado",
                 "upcoming": "Próximo",
                 "expired": "Expirado",

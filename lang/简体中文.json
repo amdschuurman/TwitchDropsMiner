@@ -109,6 +109,7 @@
             "claimed_drops": "已领取",
             "filters": {
                 "active": "活动中",
+                "linked": "已关联",
                 "not_linked": "未关联",
                 "upcoming": "即将开始",
                 "expired": "已过期",

@@ -135,6 +135,7 @@ class GUIWanted(TypedDict):
 
 class GUIInvFilters(TypedDict):
     active: str
+    linked: str
     not_linked: str
     upcoming: str
     expired: str

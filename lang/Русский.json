@@ -112,6 +112,7 @@
             "claimed_drops": "получено",
             "filters": {
                 "active": "Активные",
+                "linked": "Связаны",
                 "not_linked": "Не связаны",
                 "upcoming": "Предстоящие",
                 "expired": "Истекшие",

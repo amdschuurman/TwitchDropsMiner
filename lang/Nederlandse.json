@@ -112,6 +112,7 @@
             "claimed_drops": "geclaimd",
             "filters": {
                 "active": "Actief",
+                "linked": "Gekoppeld",
                 "not_linked": "Niet gekoppeld",
                 "upcoming": "Aankomend",
                 "expired": "Verlopen",

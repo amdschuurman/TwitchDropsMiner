@@ -109,6 +109,7 @@
             "claimed_drops": "abgeholt",
             "filters": {
                 "active": "Aktiv",
+                "linked": "Verbunden",
                 "not_linked": "Nicht Verbunden",
                 "upcoming": "Kommend",
                 "expired": "Abgelaufen",

@@ -112,6 +112,7 @@
             "claimed_drops": "diklaim",
             "filters": {
                 "active": "Aktif",
+                "linked": "Terhubung",
                 "not_linked": "Tidak Terhubung",
                 "upcoming": "Mendatang",
                 "expired": "Kadaluarsa",

@@ -111,6 +111,7 @@
             "claimed_drops": "získáno",
             "filters": {
                 "active": "Aktivní",
+                "linked": "Připojeno",
                 "not_linked": "Nepřipojeno",
                 "upcoming": "Nadcházející",
                 "expired": "Vypršelo",

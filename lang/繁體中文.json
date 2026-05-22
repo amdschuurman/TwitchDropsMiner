@@ -112,6 +112,7 @@
             "claimed_drops": "已領取",
             "filters": {
                 "active": "活動中",
+                "linked": "已連結",
                 "not_linked": "未連結",
                 "upcoming": "即將開始",
                 "expired": "已過期",

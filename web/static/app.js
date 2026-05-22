@@ -77,13 +77,29 @@ async function fetchAndDisplayVersion() {
     }
 }
 
-// Initialize Socket.IO connection
+// If the user landed here from a one-shot bootstrap URL (?token=...) we exchange
+// the URL token for an httpOnly session cookie, then strip the token from the URL
+// so it does not stick around in history/copy-paste. The redirect happens before
+// Socket.IO connects, so the cookie is in place by the time the handshake fires.
+(function consumeBootstrapToken() {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('token');
+    if (!token) return;
+    // Bounce through the server bootstrap endpoint so the cookie is set by the
+    // origin (browsers reject cross-document Set-Cookie via fetch responses for
+    // some paths). A 303 redirect sends us back to / without the token.
+    window.location.replace('/api/session/bootstrap?token=' + encodeURIComponent(token));
+})();
+
+// Initialize Socket.IO connection. withCredentials forces the cookie to be sent
+// with the handshake even when the page is served over a non-default port.
 const socket = io({
     transports: ['websocket', 'polling'],
     reconnection: true,
     reconnectionDelay: 1000,
     reconnectionDelayMax: 5000,
-    reconnectionAttempts: Infinity
+    reconnectionAttempts: Infinity,
+    withCredentials: true
 });
 
 // ==================== Socket.IO Event Handlers ====================
@@ -578,11 +594,14 @@ function updateDrop(campaignId, dropData) {
 function getInventoryFilters() {
     // Get filter state from UI checkboxes and selected games array
     return {
+        // Time-status group (OR within group, group acts as filter only if any box checked)
         show_active: document.getElementById('filter-active')?.checked || false,
-        show_not_linked: document.getElementById('filter-not-linked')?.checked ?? false,
         show_upcoming: document.getElementById('filter-upcoming')?.checked || false,
         show_expired: document.getElementById('filter-expired')?.checked || false,
         show_finished: document.getElementById('filter-finished')?.checked || false,
+        // Linked-status group (orthogonal to time-status; AND'd with it)
+        show_linked: document.getElementById('filter-linked')?.checked || false,
+        show_not_linked: document.getElementById('filter-not-linked')?.checked || false,
         game_name_search: [...selectedInventoryGames],  // Array of selected game names
         // Benefit type filters (default to true if checkbox doesn't exist)
         show_benefit_item: document.getElementById('filter-benefit-item')?.checked !== false,
@@ -594,65 +613,47 @@ function getInventoryFilters() {
 
 
 function campaignMatchesFilters(campaign, filters) {
-    // Calculate "finished" status: all drops claimed
+    // Each filter group is AND'd. Within a group, checkboxes are OR'd.
+    // An empty group (no checkboxes ticked) is treated as "no filter for that dimension" and passes.
+
     const isFinished = campaign.total_drops > 0 && campaign.claimed_drops === campaign.total_drops;
 
-    // EXCLUSION filter: when "Show Not Linked" is OFF, hide campaigns where the
-    // account isn't connected (they can never be earned, so they only add noise).
-    // Applied before inclusion checks so it overrides them.
-    if (!filters.show_not_linked && !campaign.linked) {
-        return false;
+    // 1. Time-status group: Active / Upcoming / Expired / Finished
+    const hasTimeFilter = filters.show_active || filters.show_upcoming ||
+        filters.show_expired || filters.show_finished;
+    if (hasTimeFilter) {
+        let timeMatch = false;
+        if (filters.show_active && campaign.active) timeMatch = true;
+        if (filters.show_upcoming && campaign.upcoming) timeMatch = true;
+        if (filters.show_expired && campaign.expired) timeMatch = true;
+        if (filters.show_finished && isFinished) timeMatch = true;
+        if (!timeMatch) return false;
     }
 
-    // Check if any inclusion filter is enabled
+    // 2. Linked-status group: Linked / Not Linked (orthogonal to time-status)
+    const hasLinkedFilter = filters.show_linked || filters.show_not_linked;
+    if (hasLinkedFilter) {
+        let linkedMatch = false;
+        if (filters.show_linked && campaign.linked) linkedMatch = true;
+        if (filters.show_not_linked && !campaign.linked) linkedMatch = true;
+        if (!linkedMatch) return false;
+    }
+
+    // 3. Game name filter (campaign must match at least one selected game)
     const hasGameFilter = filters.game_name_search && filters.game_name_search.length > 0;
-    const anyFilterEnabled = filters.show_active ||
-        filters.show_upcoming || filters.show_expired ||
-        filters.show_finished || hasGameFilter;
-
-    // If no inclusion filters enabled, show all campaigns (after exclusion above)
-    if (!anyFilterEnabled) {
-        return true;
-    }
-
-    // Inclusion (OR) logic among lifecycle status filters - campaign matches if ANY checked filter applies
-    let statusMatch = false;
-
-    if (filters.show_active && campaign.active) statusMatch = true;
-    if (filters.show_upcoming && campaign.upcoming) statusMatch = true;
-    if (filters.show_expired && campaign.expired) statusMatch = true;
-    if (filters.show_finished && isFinished) statusMatch = true;
-
-    // If status filters are enabled but campaign doesn't match any, filter it out
-    const hasStatusFilters = filters.show_active ||
-        filters.show_upcoming || filters.show_expired ||
-        filters.show_finished;
-    if (hasStatusFilters && !statusMatch) {
+    if (hasGameFilter && !filters.game_name_search.includes(campaign.game_name)) {
         return false;
     }
 
-    // Check game name filter (AND logic with status filters, OR logic among selected games)
-    if (hasGameFilter) {
-        const gameName = campaign.game_name;
-        // Campaign must match at least ONE of the selected games
-        const gameMatch = filters.game_name_search.includes(gameName);
-        if (!gameMatch) {
-            return false;
-        }
-    }
-
-    // Check benefit type filter - campaign must have at least one drop with a matching benefit type
-    // Only filter if at least one benefit type is UNCHECKED (otherwise show all)
+    // 4. Benefit type group. Unchecking any benefit type filters by remaining types.
     const allBenefitsEnabled = filters.show_benefit_item && filters.show_benefit_badge &&
         filters.show_benefit_emote && filters.show_benefit_other;
-
     if (!allBenefitsEnabled && campaign.drops) {
         let benefitMatch = false;
         for (const drop of campaign.drops) {
             if (drop.benefits && drop.benefits.length > 0) {
                 for (const benefit of drop.benefits) {
                     const benefitType = (benefit.type || '').toUpperCase();
-                    // Map filter checkboxes to actual API benefit types
                     if (filters.show_benefit_item && benefitType === 'DIRECT_ENTITLEMENT') benefitMatch = true;
                     if (filters.show_benefit_badge && benefitType === 'BADGE') benefitMatch = true;
                     if (filters.show_benefit_emote && benefitType === 'EMOTE') benefitMatch = true;
@@ -660,11 +661,8 @@ function campaignMatchesFilters(campaign, filters) {
                 }
             }
         }
-        if (!benefitMatch) {
-            return false;
-        }
+        if (!benefitMatch) return false;
     }
-
 
     return true;
 }
@@ -677,12 +675,13 @@ function onInventoryFilterChange() {
 }
 
 function clearInventoryFilters() {
-    // Uncheck all filter checkboxes
+    // Uncheck all status filter checkboxes (treats group as "no filter" -> show all)
     document.getElementById('filter-active').checked = false;
-    document.getElementById('filter-not-linked').checked = false;
     document.getElementById('filter-upcoming').checked = false;
     document.getElementById('filter-expired').checked = false;
     document.getElementById('filter-finished').checked = false;
+    if (document.getElementById('filter-linked')) document.getElementById('filter-linked').checked = false;
+    document.getElementById('filter-not-linked').checked = false;
     document.getElementById('inventory-game-search').value = '';
 
     // Reset benefit type filters to checked (show all)
@@ -1090,10 +1089,14 @@ function updateSettingsUI(settings) {
     // Restore inventory filters from settings
     if (settings.inventory_filters) {
         document.getElementById('filter-active').checked = settings.inventory_filters.show_active || false;
-        document.getElementById('filter-not-linked').checked = settings.inventory_filters.show_not_linked ?? false;
         document.getElementById('filter-upcoming').checked = settings.inventory_filters.show_upcoming || false;
         document.getElementById('filter-expired').checked = settings.inventory_filters.show_expired || false;
         document.getElementById('filter-finished').checked = settings.inventory_filters.show_finished || false;
+        // show_linked/show_not_linked: missing means legacy settings.json. Default both true so user sees everything.
+        if (document.getElementById('filter-linked')) {
+            document.getElementById('filter-linked').checked = settings.inventory_filters.show_linked !== false;
+        }
+        document.getElementById('filter-not-linked').checked = settings.inventory_filters.show_not_linked !== false;
 
         // Restore selected games array
         selectedInventoryGames = Array.isArray(settings.inventory_filters.game_name_search)
@@ -1263,7 +1266,10 @@ function handleDragStart(e) {
     draggedElement = e.target;
     e.target.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/html', e.target.innerHTML);
+    // Firefox needs *some* data on the transfer for the drag to actually
+    // start. Use plain text so we never leak the source element's innerHTML
+    // into the drag payload (CWE-79 / SEC-009).
+    e.dataTransfer.setData('text/plain', e.target.dataset.game || '');
 }
 
 function handleDragOver(e) {
@@ -1861,10 +1867,11 @@ function applyTranslations(t) {
             if (el) el.textContent = text;
         };
         updateLabel('filter-active', f.active);
-        updateLabel('filter-not-linked', f.not_linked);
         updateLabel('filter-upcoming', f.upcoming);
         updateLabel('filter-expired', f.expired);
         updateLabel('filter-finished', f.finished);
+        updateLabel('filter-linked', f.linked);
+        updateLabel('filter-not-linked', f.not_linked);
         updateLabel('filter-benefit-item', f.item);
         updateLabel('filter-benefit-badge', f.badge);
         updateLabel('filter-benefit-emote', f.emote);
@@ -1986,10 +1993,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Inventory filters
     document.getElementById('filter-active').addEventListener('change', onInventoryFilterChange);
-    document.getElementById('filter-not-linked').addEventListener('change', onInventoryFilterChange);
     document.getElementById('filter-upcoming').addEventListener('change', onInventoryFilterChange);
     document.getElementById('filter-expired').addEventListener('change', onInventoryFilterChange);
     document.getElementById('filter-finished').addEventListener('change', onInventoryFilterChange);
+    if (document.getElementById('filter-linked')) {
+        document.getElementById('filter-linked').addEventListener('change', onInventoryFilterChange);
+    }
+    document.getElementById('filter-not-linked').addEventListener('change', onInventoryFilterChange);
     // Benefit type filters
     document.getElementById('filter-benefit-item').addEventListener('change', onInventoryFilterChange);
     document.getElementById('filter-benefit-badge').addEventListener('change', onInventoryFilterChange);

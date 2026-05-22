@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 import traceback
@@ -20,14 +21,19 @@ if __name__ == "__main__":
     from src.core.client import Twitch
     from src.exceptions import CaptchaRequired
     from src.i18n import _
+    from src.utils.log_redaction import SecretRedactingFilter
     from src.version import __version__
 
     logger = logging.getLogger("TwitchDrops")
     if logger.level < logging.INFO:
         logger.setLevel(logging.INFO)
-    # Always add console handler
+    # Always add console handler. The redaction filter is attached at handler
+    # level so it catches log records from every child logger that propagates
+    # to the TwitchDrops handlers (gql, websocket, etc.).
+    secret_filter = SecretRedactingFilter()
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(FILE_FORMATTER)
+    console_handler.addFilter(secret_filter)
     logger.addHandler(console_handler)
 
     # Create logs directory if it doesn't exist
@@ -38,6 +44,7 @@ if __name__ == "__main__":
     # Add file handler for timestamped log
     file_handler = TimedRotatingFileHandler(log_file, when="midnight", backupCount=5)
     file_handler.setFormatter(FILE_FORMATTER)
+    file_handler.addFilter(secret_filter)
     logger.addHandler(file_handler)
 
     logger.info("Logger initialized")
@@ -79,9 +86,23 @@ if __name__ == "__main__":
         client.gui = WebGUIManager(client)
         # Set up webapp references
         webapp.set_managers(client.gui, client)
-        # Start web server in background
-        logger.info("Starting web server on http://0.0.0.0:8080")
-        web_server_task = asyncio.create_task(webapp.run_server(host="0.0.0.0", port=8080))
+        # Start web server in background. Default to loopback; opt in to LAN
+        # exposure by setting TDM_HOST=0.0.0.0 (or any other interface).
+        bind_host = os.environ.get("TDM_HOST", "127.0.0.1")
+        bind_port = int(os.environ.get("TDM_PORT", "8080"))
+        logger.info(f"Starting web server on http://{bind_host}:{bind_port}")
+
+        # Generate / load the API session token and print the bootstrap URL
+        # operators must open once on any non-loopback browser to install the
+        # session cookie. On loopback the cookie is installed automatically.
+        from src.auth.api_token import bootstrap_url, load_or_create_token
+
+        api_token = load_or_create_token()
+        logger.info(
+            "Bootstrap URL (open once from a remote browser): "
+            + bootstrap_url(bind_host, bind_port, api_token)
+        )
+        web_server_task = asyncio.create_task(webapp.run_server(host=bind_host, port=bind_port))
 
         loop = asyncio.get_running_loop()
         if sys.platform == "linux":

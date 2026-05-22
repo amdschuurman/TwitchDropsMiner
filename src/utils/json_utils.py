@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from enum import Enum
@@ -155,6 +157,10 @@ def json_save(path: Path, contents: Mapping[Any, Any], *, sort: bool = False) ->
     """
     Save data to a JSON file with custom serialization.
 
+    The file is created with restrictive permissions (0o600) so that other
+    users on the host cannot read potentially sensitive content such as proxy
+    URLs that embed credentials.
+
     Args:
         path: Path to save JSON file
         contents: Data to serialize
@@ -162,3 +168,8 @@ def json_save(path: Path, contents: Mapping[Any, Any], *, sort: bool = False) ->
     """
     with open(path, "w", encoding="utf8") as file:
         json.dump(contents, file, default=_serialize, sort_keys=sort, indent=4)
+    # If the file pre-existed with looser perms, harden it now. New files
+    # created via open() will already have the umask-restricted mode, so this
+    # is mostly a defensive no-op for fresh installs.
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)

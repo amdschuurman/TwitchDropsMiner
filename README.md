@@ -80,6 +80,31 @@ Make sure your Twitch account is linked to your game accounts →
 
 ---
 
+## 🔐 Security & Auth
+
+This fork hardens the local web UI. Default behavior is single-user, on-host friendly:
+
+| Scenario | What you need to do |
+|---|---|
+| Browser on the same machine as the miner (loopback) | Nothing — the session cookie is installed automatically on first page load. |
+| Browser on another LAN device, or accessing through `docker-compose up` from a remote host | Open the **bootstrap URL** printed on startup (look for the line `Bootstrap URL: http://…/?token=…`) once. The token is exchanged for an httpOnly cookie; subsequent visits are cookie-only. |
+| Docker on the LAN | Edit `docker-compose.yml` and replace `127.0.0.1:8080:8080` with `0.0.0.0:8080:8080`, then open the bootstrap URL from the remote browser. |
+
+The token lives in `data/api_token` (mode `0600`). Delete the file to rotate it.
+
+**Environment variables:**
+
+- `TDM_HOST` — bind interface for uvicorn (default `127.0.0.1`; set to `0.0.0.0` for LAN)
+- `TDM_PORT` — bind port (default `8080`)
+
+### 🔁 Upgrading from earlier versions / forks
+
+`data/cookies.jar` (your Twitch session) and `data/settings.json` are preserved across upgrades; the new `data/api_token` is generated on first boot.
+
+The Docker image now runs as a non-root user (UID 1000). If you previously ran the old image as root, the entrypoint will re-`chown` `./data` and `./logs` on the next container start — your cookies survive, no manual migration needed.
+
+---
+
 ## ⚠️ Notes & Warnings
 
 > ⚠️ **Avoid Watching on the Same Account**  

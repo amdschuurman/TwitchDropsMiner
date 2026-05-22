@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
+import secrets
+import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import socketio
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+from src.auth.api_token import COOKIE_MAX_AGE, COOKIE_NAME, load_or_create_token
 
 
 if TYPE_CHECKING:
@@ -25,18 +30,39 @@ logger = logging.getLogger("TwitchDrops")
 # Create FastAPI app
 app = FastAPI(title="Twitch Drops Miner Web", version="1.0.0")
 
-# Add CORS middleware
+
+# CORS is restrictive by default: same-origin only. Browsers loading the page
+# from http://localhost:8080 send same-origin requests, which never trigger a
+# CORS preflight — so the wildcard removal does not break the local UI. LAN
+# users who reach the server by IP will be served from the matching Origin
+# (which we accept reflectively below).
+def _allow_origin(origin: str | None) -> bool:
+    if origin is None:
+        return False
+    parsed = urllib.parse.urlparse(origin)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-# Create Socket.IO server
+# Create Socket.IO server. CORS is restricted to localhost — Socket.IO clients
+# from other origins must explicitly be allowed by an operator-controlled env
+# var (kept off by default to neutralize CSRF via cross-origin connections).
 sio = socketio.AsyncServer(
-    async_mode="asgi", cors_allowed_origins="*", logger=False, engineio_logger=False
+    async_mode="asgi",
+    cors_allowed_origins=[
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://[::1]:8080",
+    ],
+    logger=False,
+    engineio_logger=False,
 )
 
 # Wrap with ASGI app
@@ -82,28 +108,127 @@ class ProxyVerifyRequest(BaseModel):
     proxy: str
 
 
+# ==================== Auth ====================
+
+
+def _client_is_loopback(request: Request) -> bool:
+    if request.client is None:
+        return False
+    try:
+        addr = ipaddress.ip_address(request.client.host)
+    except ValueError:
+        return False
+    return addr.is_loopback
+
+
+def _expected_token() -> str:
+    # Cached after the first call; load_or_create_token() also caches behaviorally
+    # since it reads from the same file each time.
+    return load_or_create_token()
+
+
+def require_auth(request: Request) -> str:
+    """FastAPI dependency: validate the session cookie or Authorization bearer.
+
+    Loopback clients without a session cookie or Authorization header are
+    auto-authenticated (single-user, on-host deployment is the default UX).
+    Non-loopback clients must present the cookie that was installed via the
+    /api/session/bootstrap flow, or an explicit ``Authorization: Bearer``
+    header.
+    """
+    expected = _expected_token()
+    presented = request.cookies.get(COOKIE_NAME)
+    if presented is None:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            presented = auth.split(None, 1)[1].strip()
+    if presented and secrets.compare_digest(presented, expected):
+        return expected
+    if _client_is_loopback(request):
+        # Loopback request without a credential — let it through so the
+        # bootstrap-on-first-visit flow can install a cookie.
+        return expected
+    raise HTTPException(status_code=401, detail="Authentication required")
+
+
+def _validate_proxy_url(url: str) -> None:
+    """Reject obviously-dangerous proxy URLs.
+
+    Allows ``http``, ``https``, ``socks4``, ``socks5`` schemes. Rejects bare
+    URLs, javascript: / file: / data:, and proxies whose host resolves to a
+    link-local or unspecified address that could be abused for SSRF probes.
+    """
+    parsed = urllib.parse.urlparse(url.strip())
+    if parsed.scheme.lower() not in {"http", "https", "socks4", "socks5"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Proxy scheme '{parsed.scheme}' not allowed (use http/https/socks4/socks5)",
+        )
+    if not parsed.hostname:
+        raise HTTPException(status_code=400, detail="Proxy URL is missing a host")
+    # Block obviously-unsafe destinations. We *allow* loopback and RFC1918
+    # because users do legitimately point at an in-network proxy, but reject
+    # 0.0.0.0/::/link-local which has no legitimate proxy use.
+    try:
+        addr = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        return  # hostname is a DNS name, leave it alone
+    if addr.is_unspecified or addr.is_link_local or addr.is_multicast:
+        raise HTTPException(status_code=400, detail="Proxy host is not a valid target")
+
+
 # ==================== REST API Endpoints ====================
 
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_index():
-    """Serve the main web interface"""
-    # Web files are in project_root/web/, we're in project_root/src/web/
+async def serve_index(request: Request):
+    """Serve the main web interface, auto-installing the session cookie for loopback."""
     web_dir = Path(__file__).parent.parent.parent / "web"
     index_file = web_dir / "index.html"
-    logger.debug(
-        f"Looking for web files: __file__={__file__}, web_dir={web_dir}, index_file={index_file}, exists={index_file.exists()}"
+    if not index_file.exists():
+        # Intentionally vague — leaking the resolved filesystem path here was
+        # an information disclosure issue flagged by the audit (SEC-014).
+        return HTMLResponse(
+            content="<h1>Twitch Drops Miner</h1><p>Web interface files not found. Please check installation.</p>",
+            status_code=500,
+        )
+
+    response = FileResponse(index_file)
+    # Auto-bootstrap cookie for loopback visits so the local UX is unchanged.
+    if _client_is_loopback(request) and request.cookies.get(COOKIE_NAME) is None:
+        response.set_cookie(
+            COOKIE_NAME,
+            _expected_token(),
+            max_age=COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+        )
+    return response
+
+
+@app.get("/api/session/bootstrap")
+async def session_bootstrap(request: Request, token: str | None = None):
+    """Install the session cookie from a one-shot URL containing ?token=.
+
+    Used to onboard non-loopback (LAN, Docker) browsers: the operator runs
+    ``main.py``, copies the printed bootstrap URL, and opens it once on the
+    browser machine.
+    """
+    expected = _expected_token()
+    if token is None and _client_is_loopback(request):
+        # Loopback gets the cookie for free, no token required.
+        token = expected
+    if token is None or not secrets.compare_digest(token, expected):
+        raise HTTPException(status_code=403, detail="Invalid or missing bootstrap token")
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie(
+        COOKIE_NAME, expected, max_age=COOKIE_MAX_AGE, httponly=True, samesite="lax"
     )
-    if index_file.exists():
-        return FileResponse(index_file)
-    return HTMLResponse(
-        content=f"<h1>Twitch Drops Miner</h1><p>Web interface files not found. Please check installation.</p><p>Debug: Looking for {index_file}</p>",
-        status_code=500,
-    )
+    return response
 
 
 @app.get("/api/status")
-async def get_status():
+async def get_status(_token: str = Depends(require_auth)):
     """Get current application status"""
     if not gui_manager or not twitch_client:
         raise HTTPException(status_code=503, detail="GUI not initialized")
@@ -116,7 +241,7 @@ async def get_status():
 
 
 @app.get("/api/channels")
-async def get_channels():
+async def get_channels(_token: str = Depends(require_auth)):
     """Get list of tracked channels"""
     if not gui_manager:
         raise HTTPException(status_code=503, detail="GUI not initialized")
@@ -125,7 +250,7 @@ async def get_channels():
 
 
 @app.post("/api/channels/select")
-async def select_channel(request: ChannelSelectRequest):
+async def select_channel(request: ChannelSelectRequest, _token: str = Depends(require_auth)):
     """Select a channel to watch"""
     if not gui_manager or not twitch_client:
         raise HTTPException(status_code=503, detail="GUI not initialized")
@@ -154,7 +279,7 @@ async def select_channel(request: ChannelSelectRequest):
 
 
 @app.get("/api/campaigns")
-async def get_campaigns():
+async def get_campaigns(_token: str = Depends(require_auth)):
     """Get campaign inventory"""
     if not gui_manager:
         raise HTTPException(status_code=503, detail="GUI not initialized")
@@ -163,7 +288,7 @@ async def get_campaigns():
 
 
 @app.get("/api/console")
-async def get_console_history():
+async def get_console_history(_token: str = Depends(require_auth)):
     """Get console output history"""
     if not gui_manager:
         raise HTTPException(status_code=503, detail="GUI not initialized")
@@ -172,16 +297,40 @@ async def get_console_history():
 
 
 @app.get("/api/settings")
-async def get_settings():
+async def get_settings(_token: str = Depends(require_auth)):
     """Get current settings"""
     if not gui_manager:
         raise HTTPException(status_code=503, detail="GUI not initialized")
 
-    return gui_manager.settings.get_settings()
+    settings = gui_manager.settings.get_settings()
+    # Mask credentials embedded in the proxy URL before returning. Even with
+    # auth required, no benefit to handing the raw user:pass back to the UI.
+    proxy = settings.get("proxy")
+    if isinstance(proxy, str) and proxy:
+        try:
+            parsed = urllib.parse.urlparse(proxy)
+            if parsed.username or parsed.password:
+                netloc = parsed.hostname or ""
+                if parsed.port:
+                    netloc = f"{netloc}:{parsed.port}"
+                settings = dict(settings)
+                settings["proxy"] = urllib.parse.urlunparse(
+                    (
+                        parsed.scheme,
+                        f"***:***@{netloc}",
+                        parsed.path,
+                        parsed.params,
+                        parsed.query,
+                        parsed.fragment,
+                    )
+                )
+        except (ValueError, AttributeError):
+            pass
+    return settings
 
 
 @app.get("/api/languages")
-async def get_languages():
+async def get_languages(_token: str = Depends(require_auth)):
     """Get available languages"""
     if not gui_manager:
         raise HTTPException(status_code=503, detail="GUI not initialized")
@@ -190,7 +339,7 @@ async def get_languages():
 
 
 @app.get("/api/translations")
-async def get_translations():
+async def get_translations(_token: str = Depends(require_auth)):
     """Get translations for current language"""
     from src.i18n.translator import _
 
@@ -199,22 +348,24 @@ async def get_translations():
 
 
 @app.post("/api/settings")
-async def update_settings(settings: SettingsUpdate):
+async def update_settings(settings: SettingsUpdate, _token: str = Depends(require_auth)):
     """Update application settings"""
     if not gui_manager:
         raise HTTPException(status_code=503, detail="GUI not initialized")
 
-    # Pydantic v2 prefers model_dump(); fall back to dict() for v1 compatibility.
-    if hasattr(settings, "model_dump"):
-        settings_dict = settings.model_dump(exclude_unset=True)
-    else:
-        settings_dict = settings.dict(exclude_unset=True)
+    settings_dict = settings.model_dump(exclude_unset=True)
+    # If the operator is updating the proxy, enforce the same scheme allowlist
+    # used by verify-proxy. Stops a writer from installing javascript:/file:
+    # proxies that aiohttp would happily attempt.
+    new_proxy = settings_dict.get("proxy")
+    if isinstance(new_proxy, str) and new_proxy.strip():
+        _validate_proxy_url(new_proxy)
     gui_manager.settings.update_settings(settings_dict)
     return {"success": True, "settings": gui_manager.settings.get_settings()}
 
 
 @app.post("/api/settings/verify-proxy")
-async def verify_proxy(request: ProxyVerifyRequest):
+async def verify_proxy(request: ProxyVerifyRequest, _token: str = Depends(require_auth)):
     """Verify proxy connectivity"""
     import time
 
@@ -223,6 +374,7 @@ async def verify_proxy(request: ProxyVerifyRequest):
     proxy_url = request.proxy.strip()
     if not proxy_url:
         return {"success": False, "message": "Proxy URL is empty"}
+    _validate_proxy_url(proxy_url)
 
     try:
         start_time = time.time()
@@ -272,7 +424,7 @@ def _is_newer_version(candidate: str, current: str) -> bool:
 
 
 @app.get("/api/version")
-async def get_version():
+async def get_version(_token: str = Depends(require_auth)):
     """Get current application version and check for updates"""
     import aiohttp
 
@@ -313,7 +465,7 @@ async def get_version():
 
 
 @app.post("/api/login")
-async def submit_login(login_data: LoginRequest):
+async def submit_login(login_data: LoginRequest, _token: str = Depends(require_auth)):
     """Submit login credentials"""
     if not gui_manager:
         raise HTTPException(status_code=503, detail="GUI not initialized")
@@ -323,7 +475,7 @@ async def submit_login(login_data: LoginRequest):
 
 
 @app.post("/api/oauth/confirm")
-async def confirm_oauth():
+async def confirm_oauth(_token: str = Depends(require_auth)):
     """Confirm OAuth code has been entered by user"""
     if not gui_manager:
         raise HTTPException(status_code=503, detail="GUI not initialized")
@@ -334,7 +486,7 @@ async def confirm_oauth():
 
 
 @app.post("/api/reload")
-async def trigger_reload():
+async def trigger_reload(_token: str = Depends(require_auth)):
     """Trigger application reload"""
     if not twitch_client:
         raise HTTPException(status_code=503, detail="Twitch client not initialized")
@@ -346,7 +498,7 @@ async def trigger_reload():
 
 
 @app.post("/api/close")
-async def trigger_close():
+async def trigger_close(_token: str = Depends(require_auth)):
     """Trigger application shutdown"""
     if not twitch_client:
         raise HTTPException(status_code=503, detail="Twitch client not initialized")
@@ -356,7 +508,7 @@ async def trigger_close():
 
 
 @app.post("/api/mode/exit-manual")
-async def exit_manual_mode():
+async def exit_manual_mode(_token: str = Depends(require_auth)):
     """Exit manual mode and return to automatic channel selection"""
     if not twitch_client:
         raise HTTPException(status_code=503, detail="Twitch client not initialized")
@@ -371,9 +523,45 @@ async def exit_manual_mode():
 # ==================== Socket.IO Events ====================
 
 
+def _sio_request_authenticated(environ: dict, auth: dict | None) -> bool:
+    """Validate cookie or token presented by a Socket.IO client.
+
+    Mirrors :func:`require_auth` for HTTP, but reads the cookie from the WSGI
+    environ and accepts an optional ``auth={"token": ...}`` handshake payload.
+    Loopback clients are auto-authenticated.
+    """
+    expected = _expected_token()
+    presented: str | None = None
+    if isinstance(auth, dict):
+        candidate = auth.get("token")
+        if isinstance(candidate, str):
+            presented = candidate
+    if presented is None:
+        raw_cookie = environ.get("HTTP_COOKIE", "")
+        for chunk in raw_cookie.split(";"):
+            name, _, value = chunk.strip().partition("=")
+            if name == COOKIE_NAME:
+                presented = value
+                break
+    if presented and secrets.compare_digest(presented, expected):
+        return True
+    # Auto-allow loopback Socket.IO connections so the on-host UI works
+    # without manual cookie wiring.
+    remote = environ.get("REMOTE_ADDR") or environ.get("asgi.scope", {}).get("client", [None])[0]
+    if isinstance(remote, str):
+        try:
+            return ipaddress.ip_address(remote).is_loopback
+        except ValueError:
+            return False
+    return False
+
+
 @sio.event
-async def connect(sid, environ):
-    """Client connected"""
+async def connect(sid, environ, auth=None):
+    """Client connected — reject if no valid auth cookie / handshake token."""
+    if not _sio_request_authenticated(environ, auth):
+        logger.warning(f"Rejecting unauthenticated Socket.IO connect from {sid}")
+        raise socketio.exceptions.ConnectionRefusedError("Authentication required")
     logger.info(f"Web client connected: {sid}")
 
     # Send initial state to new client

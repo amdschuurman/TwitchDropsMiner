@@ -17,9 +17,9 @@ def _decode_gql_events(operation: GQLQuery):
 class TestGQLWatchEvents(unittest.IsolatedAsyncioTestCase):
     def test_gql_query_wraps_gzip_base64_payload(self):
         event_payload = [{"event": "minute-watched", "properties": {"channel": "test"}}]
-        compressed = base64.b64encode(gzip.compress(json.dumps(event_payload).encode("utf8"))).decode(
-            "utf8"
-        )
+        compressed = base64.b64encode(
+            gzip.compress(json.dumps(event_payload).encode("utf8"))
+        ).decode("utf8")
 
         operation = GQLQuery("mutation Example { ok }", compressed)
 
@@ -63,7 +63,9 @@ class TestGQLWatchEvents(unittest.IsolatedAsyncioTestCase):
         twitch = MagicMock()
         twitch.gui.channels = MagicMock()
         twitch._auth_state.user_id = 12345
-        twitch.gql_request = AsyncMock(return_value={"data": {"sendSpadeEvents": {"statusCode": 204}}})
+        twitch.gql_request = AsyncMock(
+            return_value={"data": {"sendSpadeEvents": {"statusCode": 204}}}
+        )
         channel = Channel(twitch, id=67890, login="example_channel")
         channel._stream = Stream(
             channel,

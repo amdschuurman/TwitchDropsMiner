@@ -7,7 +7,9 @@ Handles HTTP session management, request retries, and connection quality setting
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
 from collections import abc
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -229,5 +231,10 @@ class HTTPClient:
                     del cookie_jar._cookies[cookie_key]
 
             cookie_jar.save(COOKIES_PATH)
+            # Restrict cookie-jar permissions to user-only after every write.
+            # cookies.jar contains the Twitch auth-token and must not be world-
+            # or group-readable on shared hosts.
+            with contextlib.suppress(OSError):
+                os.chmod(COOKIES_PATH, 0o600)
             await self._session.close()
             self._session = None

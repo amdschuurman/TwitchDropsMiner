@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
 from typing import TYPE_CHECKING, cast
 
 import aiohttp
 from yarl import URL
 
 from src.config import COOKIES_PATH
+from src.exceptions import MinerException
 from src.i18n import _
 from src.utils import CHARS_HEX_LOWER, create_nonce
 
@@ -227,7 +230,15 @@ class _AuthState:
             # self.client_version = match.group(1)
             # doing the request ends up setting the "unique_id" value in the cookie
             cookie = jar.filter_cookies(client_info.CLIENT_URL)
-            self.device_id = cookie["unique_id"].value
+            unique_id_morsel = cookie.get("unique_id")
+            if unique_id_morsel is None:
+                # Stale/cleared jar; force a fresh unique_id by re-requesting after clearing.
+                assert client_info.CLIENT_URL.host is not None
+                jar.clear_domain(client_info.CLIENT_URL.host)
+                raise MinerException(
+                    "Twitch did not return a unique_id cookie; cookie jar has been cleared, please retry."
+                )
+            self.device_id = unique_id_morsel.value
         if not self._hasattrs("access_token", "user_id"):
             # looks like we're missing something
             login_form: LoginForm = self._twitch.gui.login
@@ -275,6 +286,8 @@ class _AuthState:
             # update our cookie and save it
             jar.update_cookies(cookie, client_info.CLIENT_URL)
             jar.save(COOKIES_PATH)
+            with contextlib.suppress(OSError):
+                os.chmod(COOKIES_PATH, 0o600)
         self._logged_in.set()
 
     def invalidate(self):

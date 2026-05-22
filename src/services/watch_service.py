@@ -14,7 +14,7 @@ from time import time
 from typing import TYPE_CHECKING, NoReturn
 
 from src.config import CALL, GQL_OPERATIONS, WATCH_INTERVAL
-from src.exceptions import GQLException
+from src.exceptions import GQLException, MinerException, RequestException
 from src.i18n import _
 from src.utils import task_wrapper
 
@@ -210,16 +210,22 @@ class WatchService:
                 # or even "pretend" mining as a last resort option.
                 handled: bool = False
 
-                # Solution 1: use GQL to query for the currently mined drop status
+                # Solution 1: use GQL to query for the currently mined drop status.
+                # Hard-bound the call so a stuck Twitch/GQL endpoint can't pin the watch loop
+                # indefinitely - watch ticks must keep firing for drops to progress.
+                drop_data: JsonType | None = None
                 try:
-                    context = await self._twitch.gql_request(
-                        GQL_OPERATIONS["CurrentDrop"].with_variables({"channelID": str(channel.id)})
+                    context = await asyncio.wait_for(
+                        self._twitch.gql_request(
+                            GQL_OPERATIONS["CurrentDrop"].with_variables(
+                                {"channelID": str(channel.id)}
+                            )
+                        ),
+                        timeout=30,
                     )
-                    drop_data: JsonType | None = context["data"]["currentUser"][
-                        "dropCurrentSession"
-                    ]
-                except GQLException:
-                    drop_data = None
+                    drop_data = context["data"]["currentUser"]["dropCurrentSession"]
+                except (GQLException, MinerException, RequestException, asyncio.TimeoutError, KeyError, TypeError) as exc:
+                    logger.log(CALL, f"watch_loop CurrentDrop GQL fallback failed: {exc!r}")
 
                 if drop_data is not None:
                     gql_drop: TimedDrop | None = self._twitch._drops.get(drop_data["dropID"])

@@ -20,7 +20,10 @@ from src.config import (
 )
 from src.exceptions import (
     ExitRequest,
+    GQLException,
+    MinerException,
     RequestException,
+    WebsocketClosed,
 )
 from src.i18n import _
 from src.models.campaign import DropsCampaign
@@ -137,7 +140,7 @@ class Twitch:
         self._mnt_triggers.clear()
         # wait at least half a second + whatever it takes to complete the closing
         # this allows aiohttp to safely close the session
-        await asyncio.sleep(start_time + 0.5 - time())
+        await asyncio.sleep(max(0.0, start_time + 0.5 - time()))
 
     def wait_until_login(self) -> abc.Coroutine[Any, Any, Literal[True]]:
         """Wait until the user is logged in."""
@@ -175,7 +178,15 @@ class Twitch:
             self.websocket.remove_topics(topics_to_remove)
 
     async def run(self) -> None:
-        """Main entry point for the miner - handles exit requests."""
+        """Main entry point for the miner - handles exit requests.
+
+        Recovers from transient network / GQL failures inside the state machine
+        instead of letting them tear down the process. The container's restart
+        policy would bring it back up, but that drops in-memory state, websocket
+        subscriptions, and watch progress - a long-running miner needs to soak
+        through brief outages without a full restart.
+        """
+        recovery_backoff = 5
         while True:
             try:
                 await self._run()
@@ -184,6 +195,24 @@ class Twitch:
                 break
             except aiohttp.ContentTypeError as exc:
                 raise RequestException(_.t["login"]["unexpected_content"]) from exc
+            except (
+                MinerException,
+                RequestException,
+                GQLException,
+                WebsocketClosed,
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ) as exc:
+                logger.exception(
+                    "Transient error in main loop, recovering in %ds: %r",
+                    recovery_backoff,
+                    exc,
+                )
+                await asyncio.sleep(recovery_backoff)
+                # exponential backoff up to 5 minutes, then re-enter _run() which
+                # rebuilds websocket subscriptions and refetches inventory.
+                recovery_backoff = min(recovery_backoff * 2, 300)
+                continue
 
     async def _run(self) -> None:
         """

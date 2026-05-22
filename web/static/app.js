@@ -579,7 +579,7 @@ function getInventoryFilters() {
     // Get filter state from UI checkboxes and selected games array
     return {
         show_active: document.getElementById('filter-active')?.checked || false,
-        show_not_linked: document.getElementById('filter-not-linked')?.checked || false,
+        show_not_linked: document.getElementById('filter-not-linked')?.checked ?? false,
         show_upcoming: document.getElementById('filter-upcoming')?.checked || false,
         show_expired: document.getElementById('filter-expired')?.checked || false,
         show_finished: document.getElementById('filter-finished')?.checked || false,
@@ -597,28 +597,34 @@ function campaignMatchesFilters(campaign, filters) {
     // Calculate "finished" status: all drops claimed
     const isFinished = campaign.total_drops > 0 && campaign.claimed_drops === campaign.total_drops;
 
-    // Check if any filter is enabled
+    // EXCLUSION filter: when "Show Not Linked" is OFF, hide campaigns where the
+    // account isn't connected (they can never be earned, so they only add noise).
+    // Applied before inclusion checks so it overrides them.
+    if (!filters.show_not_linked && !campaign.linked) {
+        return false;
+    }
+
+    // Check if any inclusion filter is enabled
     const hasGameFilter = filters.game_name_search && filters.game_name_search.length > 0;
-    const anyFilterEnabled = filters.show_active || filters.show_not_linked ||
+    const anyFilterEnabled = filters.show_active ||
         filters.show_upcoming || filters.show_expired ||
         filters.show_finished || hasGameFilter;
 
-    // If no filters enabled, show all campaigns
+    // If no inclusion filters enabled, show all campaigns (after exclusion above)
     if (!anyFilterEnabled) {
         return true;
     }
 
-    // Check status filters (OR logic - campaign matches if ANY checked filter applies)
+    // Inclusion (OR) logic among lifecycle status filters - campaign matches if ANY checked filter applies
     let statusMatch = false;
 
     if (filters.show_active && campaign.active) statusMatch = true;
-    if (filters.show_not_linked && !campaign.linked) statusMatch = true;
     if (filters.show_upcoming && campaign.upcoming) statusMatch = true;
     if (filters.show_expired && campaign.expired) statusMatch = true;
     if (filters.show_finished && isFinished) statusMatch = true;
 
     // If status filters are enabled but campaign doesn't match any, filter it out
-    const hasStatusFilters = filters.show_active || filters.show_not_linked ||
+    const hasStatusFilters = filters.show_active ||
         filters.show_upcoming || filters.show_expired ||
         filters.show_finished;
     if (hasStatusFilters && !statusMatch) {
@@ -1047,9 +1053,9 @@ function updateLoginStatus(data) {
 
 function updateSettingsUI(settings) {
     state.settings = settings;
-    document.getElementById('dark-mode').checked = settings.dark_mode || false;
-    document.getElementById('connection-quality').value = settings.connection_quality || 1;
-    document.getElementById('minimum-refresh-interval').value = settings.minimum_refresh_interval_minutes || 30;
+    document.getElementById('dark-mode').checked = settings.dark_mode ?? false;
+    document.getElementById('connection-quality').value = settings.connection_quality ?? 1;
+    document.getElementById('minimum-refresh-interval').value = settings.minimum_refresh_interval_minutes ?? 30;
 
     // Update proxy settings and indicator
     const proxyUrl = settings.proxy || '';
@@ -1084,7 +1090,7 @@ function updateSettingsUI(settings) {
     // Restore inventory filters from settings
     if (settings.inventory_filters) {
         document.getElementById('filter-active').checked = settings.inventory_filters.show_active || false;
-        document.getElementById('filter-not-linked').checked = settings.inventory_filters.show_not_linked || false;
+        document.getElementById('filter-not-linked').checked = settings.inventory_filters.show_not_linked ?? false;
         document.getElementById('filter-upcoming').checked = settings.inventory_filters.show_upcoming || false;
         document.getElementById('filter-expired').checked = settings.inventory_filters.show_expired || false;
         document.getElementById('filter-finished').checked = settings.inventory_filters.show_finished || false;
@@ -1750,7 +1756,7 @@ function applyTranslations(t) {
     if (helpTab && t.gui?.help) {
         // Robust ID selection for Help tab headers
         const aboutHeader = document.getElementById('help-about-header');
-        if (aboutHeader) aboutHeader.textContent = t.gui.help.about || 'About Twitch Drops Miner';
+        if (aboutHeader) aboutHeader.textContent = t.gui.help.about || 'About Arend\'s Twitch Drops Miner';
 
         const howtoHeader = document.getElementById('help-howto-header');
         if (howtoHeader) howtoHeader.textContent = t.gui.help.how_to_use || 'How to Use';
@@ -1785,7 +1791,7 @@ function applyTranslations(t) {
             ];
 
             helpContent.replaceChildren(
-                makeElement('h2', { id: 'help-about-header' }, t.gui.help.about || 'About Twitch Drops Miner'),
+                makeElement('h2', { id: 'help-about-header' }, t.gui.help.about || 'About Arend\'s Twitch Drops Miner'),
                 makeElement('p', {}, t.gui.help.about_text || 'This application automatically mines timed Twitch drops without downloading stream data.'),
                 makeElement('h3', { id: 'help-howto-header' }, t.gui.help.how_to_use || 'How to Use'),
                 makeHelpList('ol', howToItems),

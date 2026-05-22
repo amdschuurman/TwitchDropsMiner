@@ -31,6 +31,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger("TwitchDrops")
 
 
+def _log_maintenance_task_result(task: asyncio.Task[Any]) -> None:
+    """Surface unexpected maintenance-task exits so they don't disappear silently."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Maintenance task died: %r", exc, exc_info=exc)
+
+
 class InventoryService:
     """
     Service responsible for inventory and campaign management.
@@ -80,10 +89,18 @@ class InventoryService:
             response_list_raw if isinstance(response_list_raw, list) else [response_list_raw]
         )
 
-        fetched_data: dict[str, JsonType] = {
-            (campaign_data := response_json["data"]["user"]["dropCampaign"])["id"]: campaign_data
-            for response_json in response_list
-        }
+        # Guard against null dropCampaign entries - Twitch returns null for campaigns that
+        # ended between the campaigns-list query and this details query. Walrus-then-index
+        # on None would KeyError and abort the whole inventory fetch.
+        fetched_data: dict[str, JsonType] = {}
+        for response_json in response_list:
+            campaign_data = response_json.get("data", {}).get("user", {}).get("dropCampaign")
+            if campaign_data is None:
+                continue
+            campaign_id = campaign_data.get("id")
+            if campaign_id is None:
+                continue
+            fetched_data[campaign_id] = campaign_data
 
         return GQLClient.merge_data(campaign_ids, fetched_data)
 
@@ -213,6 +230,10 @@ class InventoryService:
         self._twitch._mnt_task = asyncio.create_task(
             self._twitch._maintenance_service.run_maintenance_task()
         )
+        # Surface task failures via the app logger. Without this, a crash inside
+        # run_maintenance_task() shows up only as "Task exception was never retrieved"
+        # on stderr, and the periodic inventory refresh silently stops.
+        self._twitch._mnt_task.add_done_callback(_log_maintenance_task_result)
 
     def get_active_campaign(self, channel: Channel | None = None) -> DropsCampaign | None:
         """

@@ -123,7 +123,7 @@
             "minimum_refresh": "Minimum Refresh Interval (minutes):"
         },
         "help": {
-            "about": "About Twitch Drops Miner",
+            "about": "About Arend's Twitch Drops Miner",
             "about_text": "This application automatically mines timed Twitch drops without downloading stream data.",
             "how_to_use": "How to Use",
             "how_to_use_items": [
@@ -150,7 +150,7 @@
             "github_repo": "GitHub Repository"
         },
         "header": {
-            "title": "Twitch Drops Miner",
+            "title": "Arend's Twitch Drops Miner",
             "language": "Language:",
             "initializing": "Initializing...",
             "auto_mode": "AUTO",
@@ -191,7 +191,7 @@
             "claimed_drops": "claimed",
             "filters": {
                 "active": "Active",
-                "not_linked": "Not Linked",
+                "not_linked": "Show Not Linked",
                 "upcoming": "Upcoming",
                 "expired": "Expired",
                 "finished": "Finished",

@@ -202,7 +202,7 @@ class TimedDrop(BaseDrop):
     ):
         super().__init__(campaign, data, claimed_benefits)
         self.real_current_minutes: int = (
-            "self" in data and data["self"]["currentMinutesWatched"] or 0
+            data["self"]["currentMinutesWatched"] if "self" in data else 0
         )
         self.required_minutes: int = data["requiredMinutesWatched"]
         self.extra_current_minutes: int = 0

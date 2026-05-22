@@ -12,6 +12,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from src.config import CALL, GQL_OPERATIONS, State
+from src.exceptions import GQLException, MinerException, RequestException
 from src.i18n import _
 from src.utils import task_wrapper
 
@@ -217,19 +218,39 @@ class MessageHandlerService:
             await asyncio.sleep(4)
 
             if watching_channel is not None:
+                # Poll up to ~16s for Twitch to roll over to the next drop. Wrap the whole
+                # loop in a try/except so a transient GQL error after a claim doesn't kill
+                # the message handler and leave the miner idle until the next inventory tick.
                 for _attempt in range(8):
-                    context = await self._twitch.gql_request(
-                        GQL_OPERATIONS["CurrentDrop"].with_variables(
-                            {"channelID": str(watching_channel.id)}
+                    try:
+                        context = await asyncio.wait_for(
+                            self._twitch.gql_request(
+                                GQL_OPERATIONS["CurrentDrop"].with_variables(
+                                    {"channelID": str(watching_channel.id)}
+                                )
+                            ),
+                            timeout=15,
                         )
-                    )
-                    drop_data: JsonType | None = context["data"]["currentUser"][
-                        "dropCurrentSession"
-                    ]
+                        drop_data: JsonType | None = context["data"]["currentUser"][
+                            "dropCurrentSession"
+                        ]
+                    except (
+                        GQLException,
+                        MinerException,
+                        RequestException,
+                        asyncio.TimeoutError,
+                        KeyError,
+                        TypeError,
+                    ) as exc:
+                        logger.log(CALL, f"post-claim CurrentDrop poll failed: {exc!r}")
+                        break
                     if drop_data is None or drop_data["dropID"] != drop.id:
                         break
                     await asyncio.sleep(2)
 
+            # Always advance: either kick the watch loop or trigger an inventory refresh.
+            # Falling through without doing one of these is the failure mode that left the
+            # miner sitting idle after claiming a drop.
             if campaign.can_earn(watching_channel):
                 self._twitch.restart_watching()
             else:

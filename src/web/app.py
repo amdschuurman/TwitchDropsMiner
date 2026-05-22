@@ -204,7 +204,11 @@ async def update_settings(settings: SettingsUpdate):
     if not gui_manager:
         raise HTTPException(status_code=503, detail="GUI not initialized")
 
-    settings_dict = settings.dict(exclude_unset=True)
+    # Pydantic v2 prefers model_dump(); fall back to dict() for v1 compatibility.
+    if hasattr(settings, "model_dump"):
+        settings_dict = settings.model_dump(exclude_unset=True)
+    else:
+        settings_dict = settings.dict(exclude_unset=True)
     gui_manager.settings.update_settings(settings_dict)
     return {"success": True, "settings": gui_manager.settings.get_settings()}
 
@@ -244,6 +248,29 @@ async def verify_proxy(request: ProxyVerifyRequest):
         return {"success": False, "message": f"Connection failed: {str(e)}"}
 
 
+def _parse_version(v: str) -> tuple[int, ...]:
+    """Parse a dotted version string like '1.2.4' into (1, 2, 4). Non-numeric parts become 0."""
+    parts: list[int] = []
+    for part in v.split("."):
+        # strip prerelease/build suffixes ('1.2.4-rc1' -> 1, 2, 4)
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _is_newer_version(candidate: str, current: str) -> bool:
+    """Return True if `candidate` is a strictly newer version than `current`."""
+    try:
+        return _parse_version(candidate) > _parse_version(current)
+    except (ValueError, AttributeError):
+        return False
+
+
 @app.get("/api/version")
 async def get_version():
     """Get current application version and check for updates"""
@@ -269,8 +296,10 @@ async def get_version():
                 latest_version = data.get("tag_name", "").lstrip("v")
                 download_url = data.get("html_url")
 
-                # Compare versions (simple string comparison works for semantic versioning)
-                if latest_version and latest_version > current_version:
+                # Compare versions by parsed numeric tuple so e.g. "1.10" > "1.9".
+                # Plain string comparison is wrong for semver - lexicographic sort
+                # would mark 1.10 as older than 1.9.
+                if latest_version and _is_newer_version(latest_version, current_version):
                     update_available = True
     except Exception as e:
         logger.warning(f"Failed to check for updates: {str(e)}")

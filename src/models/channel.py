@@ -16,6 +16,7 @@ from src.config.constants import CALL, ONLINE_DELAY, GQLOperation, GQLQuery, Jso
 from src.config.operations import GQL_OPERATIONS
 from src.exceptions import MinerException, RequestException
 from src.models.game import Game
+from src.utils.async_helpers import task_wrapper
 from src.utils.json_utils import isonow, json_minify
 
 
@@ -404,14 +405,21 @@ class Channel:
         self._twitch.on_channel_update(self, old_stream, self._stream)
         return self._stream is not None
 
+    @task_wrapper
     async def _online_delay(self):
         """
         The 'stream-up' event is sent before the stream actually goes online,
         so just wait a bit and check if it's actually online by then.
+
+        Wrapped with @task_wrapper so transient GQL/network failures inside
+        update_stream() get logged instead of silently disappearing into the
+        event loop (which would leave the channel stuck flagged as not-yet-online).
         """
-        await asyncio.sleep(ONLINE_DELAY.total_seconds())
-        self._pending_stream_up = None  # for 'display' to work properly
-        await self.update_stream()
+        try:
+            await asyncio.sleep(ONLINE_DELAY.total_seconds())
+            await self.update_stream()
+        finally:
+            self._pending_stream_up = None  # for 'display' to work properly
 
     def check_online(self) -> None:
         """

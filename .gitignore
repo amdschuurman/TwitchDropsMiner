@@ -28,4 +28,5 @@ data/
 *.egg-info/
 .coverage
 
-artifacts/
+artifacts/.venv/
+.venv/

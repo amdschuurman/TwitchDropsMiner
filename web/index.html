@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Twitch Drops Miner</title>
+    <title>Arend's Twitch Drops Miner</title>
     <link rel="icon" type="image/png" href="/static/favicon.png">
     <link rel="stylesheet" href="/static/styles.css">
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
@@ -14,7 +14,7 @@
     <div class="container">
         <header>
             <div class="header-top">
-                <h1>🎮 Twitch Drops Miner</h1>
+                <h1>🎮 Arend's Twitch Drops Miner</h1>
                 <div class="header-controls">
                     <label for="language" class="language-selector">
                         <span>Language:</span>
@@ -121,12 +121,12 @@
                             <input type="checkbox" id="filter-active" />
                             <span>Active</span>
                         </label>
-                        <label class="filter-checkbox">
-                            <input type="checkbox" id="filter-not-linked" checked />
-                            <span>Not Linked</span>
+                        <label class="filter-checkbox" title="When unchecked, campaigns where your account is not linked are hidden">
+                            <input type="checkbox" id="filter-not-linked" />
+                            <span>Show Not Linked</span>
                         </label>
                         <label class="filter-checkbox">
-                            <input type="checkbox" id="filter-upcoming" checked />
+                            <input type="checkbox" id="filter-upcoming" />
                             <span>Upcoming</span>
                         </label>
                         <label class="filter-checkbox">
@@ -271,7 +271,7 @@
         <!-- Help Tab -->
         <div id="help-tab" class="tab-content">
             <div class="help-content">
-                <h2 id="help-about-header">About Twitch Drops Miner</h2>
+                <h2 id="help-about-header">About Arend's Twitch Drops Miner</h2>
                 <p>This application automatically mines timed Twitch drops without downloading stream data.</p>
 
                 <h3 id="help-howto-header">How to Use</h3>

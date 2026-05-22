@@ -157,23 +157,28 @@ class ChannelService:
             for stream_gql_chunk in chunk(stream_gql_ops, 20)
         ]
 
-        try:
-            for coro in asyncio.as_completed(stream_gql_tasks):
+        # Tolerate per-batch failures: a single transient GQL hiccup in one chunk
+        # shouldn't kill the entire CHANNELS_FETCH state and force a full miner
+        # restart. Successful chunks still populate the map; offline / failed channels
+        # just stay unupdated and will be retried on the next fetch cycle.
+        for coro in asyncio.as_completed(stream_gql_tasks):
+            try:
                 response = await coro
-                # Normalize response to a list for uniform processing
-                if isinstance(response, list):
-                    response_list: list[JsonType] = response
-                else:
-                    response_list = [response]
-                for response_json in response_list:
+            except (GQLException, MinerException, asyncio.TimeoutError) as exc:
+                logger.warning("bulk_check_online batch failed, skipping: %r", exc)
+                continue
+            # Normalize response to a list for uniform processing
+            if isinstance(response, list):
+                response_list: list[JsonType] = response
+            else:
+                response_list = [response]
+            for response_json in response_list:
+                try:
                     channel_data: JsonType = response_json["data"]["user"]
-                    if channel_data is not None:
-                        acl_streams_map[int(channel_data["id"])] = channel_data
-        except Exception:
-            # asyncio.as_completed doesn't cancel tasks on errors
-            for task in stream_gql_tasks:
-                task.cancel()
-            raise
+                except (KeyError, TypeError):
+                    continue
+                if channel_data is not None:
+                    acl_streams_map[int(channel_data["id"])] = channel_data
 
         # Update all channels with their stream data
         for channel in channels:

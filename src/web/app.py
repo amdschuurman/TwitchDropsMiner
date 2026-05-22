@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import os
 import secrets
 import urllib.parse
 from pathlib import Path
@@ -16,6 +17,30 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.auth.api_token import COOKIE_MAX_AGE, COOKIE_NAME, load_or_create_token
+
+
+def _trusted_origins() -> list[str]:
+    """Return the operator-defined allowlist for cross-origin browser requests.
+
+    Configured via the ``TDM_TRUSTED_ORIGINS`` env var as a comma-separated list
+    of origins (e.g. ``https://twitchdrops.example.com,https://lan.example``).
+    Empty by default - the regex below already covers the loopback origins that
+    on-host installs need.
+    """
+    raw = os.environ.get("TDM_TRUSTED_ORIGINS", "").strip()
+    if not raw:
+        return []
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+def _auth_disabled() -> bool:
+    """True when the operator opts out of the bearer-token auth gate.
+
+    Single-user deployments fronted by an auth-providing reverse proxy (NPM
+    access list, Authelia, Cloudflare Access, etc.) can set ``TDM_AUTH_DISABLED=true``
+    so the local UI works without the bootstrap-cookie flow.
+    """
+    return os.environ.get("TDM_AUTH_DISABLED", "").lower() in ("1", "true", "yes", "on")
 
 
 if TYPE_CHECKING:
@@ -45,21 +70,22 @@ def _allow_origin(origin: str | None) -> bool:
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=_trusted_origins(),
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?",
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
-# Create Socket.IO server. CORS is restricted to localhost — Socket.IO clients
-# from other origins must explicitly be allowed by an operator-controlled env
-# var (kept off by default to neutralize CSRF via cross-origin connections).
+# Create Socket.IO server. CORS defaults to localhost only; the operator extends
+# the allowlist via ``TDM_TRUSTED_ORIGINS`` for reverse-proxied deployments.
 sio = socketio.AsyncServer(
     async_mode="asgi",
     cors_allowed_origins=[
         "http://localhost:8080",
         "http://127.0.0.1:8080",
         "http://[::1]:8080",
+        *_trusted_origins(),
     ],
     logger=False,
     engineio_logger=False,
@@ -135,8 +161,13 @@ def require_auth(request: Request) -> str:
     Non-loopback clients must present the cookie that was installed via the
     /api/session/bootstrap flow, or an explicit ``Authorization: Bearer``
     header.
+
+    Operators on a trusted reverse-proxied deployment can set
+    ``TDM_AUTH_DISABLED=true`` to bypass this gate entirely.
     """
     expected = _expected_token()
+    if _auth_disabled():
+        return expected
     presented = request.cookies.get(COOKIE_NAME)
     if presented is None:
         auth = request.headers.get("Authorization", "")
@@ -540,8 +571,11 @@ def _sio_request_authenticated(environ: dict, auth: dict | None) -> bool:
 
     Mirrors :func:`require_auth` for HTTP, but reads the cookie from the WSGI
     environ and accepts an optional ``auth={"token": ...}`` handshake payload.
-    Loopback clients are auto-authenticated.
+    Loopback clients are auto-authenticated. ``TDM_AUTH_DISABLED`` bypasses
+    this gate to match the HTTP behaviour.
     """
+    if _auth_disabled():
+        return True
     expected = _expected_token()
     presented: str | None = None
     if isinstance(auth, dict):

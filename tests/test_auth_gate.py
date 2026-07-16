@@ -307,5 +307,83 @@ class TestSafeAccountDir(AuthGateTestBase):
         self.assertEqual(result.name, "main")
 
 
+class TestSocketIOAuthGate(AuthGateTestBase):
+    """Socket.IO connect handshake must apply the same gate as HTTP.
+
+    Regression guard: python-engineio's ASGI driver hardcodes
+    ``environ['REMOTE_ADDR'] = '127.0.0.1'``, so any loopback check that reads
+    REMOTE_ADDR treats every proxied internet client as local and accepts the
+    connection unauthenticated (leaking ``initial_state`` and exposing control
+    events). The real peer must come from ``environ['asgi.scope']['client']``.
+    """
+
+    @staticmethod
+    def _environ(client_host, cookies=None):
+        # Mirrors what python-engineio hands the connect handler: REMOTE_ADDR is
+        # ALWAYS the hardcoded loopback string; the genuine peer lives in the
+        # stored ASGI scope.
+        environ = {"REMOTE_ADDR": "127.0.0.1"}
+        if client_host is not None:
+            environ["asgi.scope"] = {"type": "websocket", "client": (client_host, 12345)}
+        else:
+            environ["asgi.scope"] = {"type": "websocket", "client": None}
+        if cookies:
+            environ["HTTP_COOKIE"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        return environ
+
+    def test_proxied_lan_client_without_credential_is_rejected(self):
+        # The exact bypass: proxied client, engineio REMOTE_ADDR=127.0.0.1,
+        # no credential. Must be refused despite the fake loopback marker.
+        self.assertFalse(
+            webapp._sio_request_authenticated(self._environ("203.0.113.7"), None)
+        )
+        self.assertFalse(
+            webapp._sio_request_authenticated(self._environ("172.18.0.10"), None)
+        )
+
+    def test_missing_scope_client_fails_closed(self):
+        self.assertFalse(
+            webapp._sio_request_authenticated(self._environ(None), None)
+        )
+
+    def test_genuine_loopback_peer_allowed_in_token_only_mode(self):
+        self.assertTrue(
+            webapp._sio_request_authenticated(self._environ("127.0.0.1"), None)
+        )
+
+    def test_valid_bearer_in_handshake_auth_is_allowed(self):
+        token = load_or_create_token()
+        self.assertTrue(
+            webapp._sio_request_authenticated(
+                self._environ("203.0.113.7"), {"token": token}
+            )
+        )
+
+    def test_valid_api_token_cookie_is_allowed(self):
+        token = load_or_create_token()
+        self.assertTrue(
+            webapp._sio_request_authenticated(
+                self._environ("203.0.113.7", cookies={webapp.COOKIE_NAME: token}), None
+            )
+        )
+
+    def test_password_mode_gates_genuine_loopback(self):
+        # With a password set, even a real loopback socket peer needs a session.
+        cfg = webapp._load_web_config()
+        cfg["password_hash"] = webapp._hash_password("hunter2")
+        cfg["setup_done"] = True
+        webapp._save_web_config(cfg)
+        self.assertFalse(
+            webapp._sio_request_authenticated(self._environ("127.0.0.1"), None)
+        )
+        session_token = webapp._issue_password_session()
+        self.assertTrue(
+            webapp._sio_request_authenticated(
+                self._environ("127.0.0.1", cookies={webapp._PW_SESSION_COOKIE: session_token}),
+                None,
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

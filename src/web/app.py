@@ -296,14 +296,36 @@ def _auth_disabled() -> bool:
     return os.environ.get("TDM_AUTH_DISABLED", "").lower() in ("1", "true", "yes", "on")
 
 
-def _client_is_loopback(request: Request) -> bool:
-    if request.client is None:
+def _host_is_loopback(host: str | None) -> bool:
+    """True only for a real loopback peer address; fail closed otherwise.
+
+    The single source of truth for loopback auto-auth on BOTH the HTTP and
+    Socket.IO planes, so the two can never disagree. Never trust
+    ``environ['REMOTE_ADDR']`` on the Socket.IO side: python-engineio's ASGI
+    driver hardcodes it to ``127.0.0.1``, which would make every proxied
+    client look local and silently bypass the gate. The genuine peer comes
+    from the ASGI ``scope['client']`` tuple (what Starlette's request.client
+    exposes too).
+    """
+    if not host:
         return False
     try:
-        addr = ipaddress.ip_address(request.client.host)
+        return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
-    return addr.is_loopback
+
+
+def _client_is_loopback(request: Request) -> bool:
+    return _host_is_loopback(request.client.host if request.client else None)
+
+
+def _sio_client_host(environ: dict) -> str | None:
+    """The genuine Socket.IO peer address from the ASGI scope (not REMOTE_ADDR)."""
+    scope = environ.get("asgi.scope")
+    client = scope.get("client") if isinstance(scope, dict) else None
+    if isinstance(client, (list, tuple)) and client:
+        return client[0]
+    return None
 
 
 def _expected_token() -> str:
@@ -2004,9 +2026,10 @@ def _sio_request_authenticated(environ: dict, auth: dict | None) -> bool:
 
     Socket.IO traffic bypasses the HTTP middleware (socketio.ASGIApp routes it
     before FastAPI), so this mirrors the unified gate: bearer token from the
-    handshake ``auth={"token": ...}`` payload or the ``tdm_session`` cookie,
-    password session via the ``__tdm_session`` cookie, loopback auto-auth only
-    in token-only mode, and ``TDM_AUTH_DISABLED`` bypassing everything.
+    handshake ``auth={"token": ...}`` payload or the api-token cookie, password
+    session via the per-instance session cookie, loopback auto-auth only in
+    token-only mode (real ASGI-scope peer, never engineio's fake REMOTE_ADDR),
+    and ``TDM_AUTH_DISABLED`` bypassing everything.
     """
     if _auth_disabled():
         return True
@@ -2030,14 +2053,10 @@ def _sio_request_authenticated(environ: dict, auth: dict | None) -> bool:
         # Password mode: same rule as HTTP — the password gates loopback too.
         return _password_session_valid(cookies.get(_PW_SESSION_COOKIE, ""))
     # Token-only mode: auto-allow loopback Socket.IO connections so the on-host
-    # UI works without manual cookie wiring.
-    remote = environ.get("REMOTE_ADDR") or environ.get("asgi.scope", {}).get("client", [None])[0]
-    if isinstance(remote, str):
-        try:
-            return ipaddress.ip_address(remote).is_loopback
-        except ValueError:
-            return False
-    return False
+    # UI works without manual cookie wiring. Uses the real ASGI scope peer, not
+    # engineio's hardcoded REMOTE_ADDR=127.0.0.1 (which would bypass the gate
+    # for every proxied client).
+    return _host_is_loopback(_sio_client_host(environ))
 
 
 @sio.event

@@ -80,8 +80,23 @@ def _harden_perms(path: Path) -> None:
 
 
 def bootstrap_url(host: str, port: int, token: str) -> str:
-    """URL the user opens once to install the session cookie."""
-    # Force a literal IP rather than 0.0.0.0 in the printed hint — the user
-    # cannot navigate to 0.0.0.0 from a browser on a remote machine.
-    display_host = "localhost" if host in ("0.0.0.0", "::", "") else host
-    return f"http://{display_host}:{port}/?token={token}"
+    """URL the user opens once to install the session cookie.
+
+    Prefers the operator's public origin (first http(s) entry of
+    ``TDM_TRUSTED_ORIGINS``) so the printed link is actually reachable from a
+    remote browser — behind a reverse proxy the bind host is an internal
+    address the user can never navigate to. Points at ``/api/session/bootstrap``,
+    which sets the cookie directly via a redirect, so it works even if the
+    page's JavaScript never runs. Falls back to the bind host for on-host use.
+    """
+    base = ""
+    for origin in os.environ.get("TDM_TRUSTED_ORIGINS", "").split(","):
+        origin = origin.strip().rstrip("/")
+        if origin.startswith(("http://", "https://")):
+            base = origin
+            break
+    if not base:
+        # No public origin configured — print a host the user can reach locally.
+        display_host = "localhost" if host in ("0.0.0.0", "::", "") else host
+        base = f"http://{display_host}:{port}"
+    return f"{base}/api/session/bootstrap?token={token}"

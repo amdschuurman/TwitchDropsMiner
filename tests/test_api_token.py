@@ -48,5 +48,36 @@ class TestApiToken(unittest.TestCase):
         self.assertEqual(path.read_text().strip(), token)
 
 
+class TestBootstrapUrl(unittest.TestCase):
+    """The printed bootstrap link must be reachable from a remote browser."""
+
+    def test_prefers_public_trusted_origin_and_direct_endpoint(self):
+        from src.auth.api_token import bootstrap_url
+
+        with patch.dict(os.environ, {"TDM_TRUSTED_ORIGINS": "https://tdm.example.xyz"}):
+            url = bootstrap_url("0.0.0.0", 8080, "TESTTOKEN")
+        # Public origin, https, and the direct cookie-setting endpoint — never
+        # the internal bind host or the JS-dependent /?token= path.
+        self.assertEqual(url, "https://tdm.example.xyz/api/session/bootstrap?token=TESTTOKEN")
+
+    def test_first_origin_wins_and_trailing_slash_stripped(self):
+        from src.auth.api_token import bootstrap_url
+
+        with patch.dict(
+            os.environ,
+            {"TDM_TRUSTED_ORIGINS": "https://tdm.example.xyz/ , https://second.example"},
+        ):
+            url = bootstrap_url("0.0.0.0", 8080, "T")
+        self.assertEqual(url, "https://tdm.example.xyz/api/session/bootstrap?token=T")
+
+    def test_falls_back_to_local_host_when_no_public_origin(self):
+        from src.auth.api_token import bootstrap_url
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TDM_TRUSTED_ORIGINS", None)
+            url = bootstrap_url("0.0.0.0", 8080, "T")
+        self.assertEqual(url, "http://localhost:8080/api/session/bootstrap?token=T")
+
+
 if __name__ == "__main__":
     unittest.main()

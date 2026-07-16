@@ -15,7 +15,7 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.vendor="amdschuurman" \
       org.opencontainers.image.title="Arend's Twitch Drops Miner" \
-      org.opencontainers.image.description="Automated Twitch drops mining application with web-based interface (forked from rangermix/TwitchDropsMiner with reliability and filter fixes)"
+      org.opencontainers.image.description="Automated Twitch drops miner with web interface: multi-account, parallel instances, predictions and Discord integration (SimpliAj fork merged) plus auth gate, CORS allowlist and reliability hardening"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -25,8 +25,10 @@ ENV PYTHONUNBUFFERED=1 \
 # Set working directory
 WORKDIR /app
 
-# Install su-exec for privilege drop after chowning bind-mounted volumes.
-RUN apk add --no-cache su-exec
+# System dependencies:
+# - tzdata: zoneinfo lookups for the TZ env var (stats/alerts timestamps)
+# - su-exec: privilege drop after chowning bind-mounted volumes
+RUN apk add --no-cache tzdata su-exec
 
 # Create non-root user so the container does not run as root after the
 # entrypoint re-execs the application. UID/GID 1000 matches the common host
@@ -58,9 +60,9 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # Expose web port
 EXPOSE 8080
 
-# Health check
+# Health check (unauthenticated liveness probe; exempt from the auth gate)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/status')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 # Run the application (web GUI is now default)

@@ -36,6 +36,7 @@
         "status": {
             "name": "Estado",
             "idle": "En espera...",
+            "ready": "Listo",
             "exiting": "Saliendo...",
             "terminated": "Aplicación suspendida.",
             "cleanup": "Limpiando canales...",
@@ -49,7 +50,10 @@
             "main": "Principal",
             "inventory": "Inventario",
             "settings": "Configuración",
-            "help": "Ayuda"
+            "help": "Ayuda",
+            "system": "System",
+            "stats": "Stats",
+            "analytics": "Analytics"
         },
         "login": {
             "name": "Inicio de sesión",
@@ -120,7 +124,8 @@
                 "other": "Otro",
                 "clear": "Limpiar Filtros",
                 "search_placeholder": "Buscar juegos..."
-            }
+            },
+            "filter_linked": "Linked"
         },
         "settings": {
             "general": {
@@ -145,10 +150,72 @@
             "connection_quality": "Calidad de conexión:",
             "minimum_refresh": "Intervalo mínimo de actualización (minutos):",
             "mining_benefits": "Beneficios de Minería",
-            "mining_benefits_help": "Selecciona qué tipos de drops deseas minar."
+            "mining_benefits_help": "Selecciona qué tipos de drops deseas minar.",
+            "select_linked": "Select Linked",
+            "password_header": "Login & Password",
+            "password_current_label": "Current Password",
+            "password_current_placeholder": "Leave empty if no password set",
+            "password_new_label": "New Password",
+            "password_new_placeholder": "New password (empty = disable login)",
+            "password_confirm_label": "Confirm New Password",
+            "password_confirm_placeholder": "Confirm",
+            "password_save": "Save Password",
+            "password_disable": "Disable Login",
+            "password_saved": "Password saved.",
+            "password_disabled_msg": "Login disabled.",
+            "password_mismatch": "Passwords don't match.",
+            "password_status_active": "🔒 Login active — Password set",
+            "password_status_inactive": "🔓 No login — publicly accessible",
+            "discord_bot": {
+                "header": "Discord Bot",
+                "description": "Conecta un bot de Discord para controlar TwitchDropsMiner mediante comandos.",
+                "not_connected": "No conectado",
+                "connected": "✅ Conectado",
+                "generate_code": "Generar código",
+                "generating": "Generando...",
+                "disconnect": "Desconectar",
+                "disconnect_confirm": "¿Desconectar el bot de Discord?",
+                "invite_bot": "Invitar bot",
+                "expires": "Expira en 10 min"
+            },
+            "notifications_header": "Notifications",
+            "push_enabled": "Browser Push Notifications",
+            "push_sound": "Notification Sound",
+            "campaign_end_alerts_enabled": "Campaign End Alerts (24h warning)",
+            "channel_points_section": "Channel Points",
+            "channel_points_auto_claim": "Auto-claim bonus channel points",
+            "channel_points_auto_claim_help": "Automatically claims the bonus chest when it appears on watched channels.",
+            "discord_notifications": "Discord Notifications",
+            "discord_drops_webhook_label": "Drop Claimed Webhook:",
+            "discord_drops_webhook_help": "Fires when a Twitch drop is successfully claimed.",
+            "discord_points_webhook_label": "Channel Points Webhook:",
+            "discord_points_webhook_help": "Fires when a bonus channel point chest is claimed.",
+            "test_webhook": "Test",
+            "proxy_url_label": "Proxy URL:",
+            "set_proxy": "Set Proxy",
+            "verify_proxy": "Verify",
+            "proxy_url_help": "Leave empty to disable. Supports HTTP/HTTPS/SOCKS.",
+            "idle_watch": "Idle Watch",
+            "idle_watch_help": "Channels to watch when no drops are available. Add in priority order.",
+            "idle_auto_followed": "Auto: use followed channels",
+            "idle_auto_followed_help": "Automatically watches live channels you follow on Twitch when idle.",
+            "idle_channel_placeholder": "Manual channel name...",
+            "idle_channel_add": "Add",
+            "blacklist": "Drop Name Blacklist",
+            "blacklist_help": "Comma-separated keywords. Drops whose name contains any keyword are ignored. Useful for regional/exclusive drops (e.g. JP, Korea, (KR)).",
+            "scheduler": "Scheduler",
+            "scheduler_help": "Automatically pause and resume mining based on time of day.",
+            "scheduler_enable": "Enable time-based scheduler",
+            "scheduler_active_from": "Active from",
+            "scheduler_active_until": "Active until",
+            "scheduler_times_help": "Mining runs only within this window. Outside it, mining is automatically paused.",
+            "bot_notification_channels": "Notification Channels",
+            "bot_setchannel_hint": "Use /setchannel in Discord to set channels.",
+            "add_account": "+ Add Account",
+            "account_label_placeholder": "Label (e.g. Main, Alt)"
         },
         "help": {
-            "about": "Acerca de Twitch Drops Miner",
+            "about": "Acerca de Arend's Twitch Drops Miner",
             "about_text": "Esta aplicación mina automáticamente drops cronometrados de Twitch sin descargar datos de transmisión.",
             "how_to_use": "Cómo usar",
             "features": "Características",
@@ -175,7 +242,7 @@
             ]
         },
         "header": {
-            "title": "Twitch Drops Miner",
+            "title": "Arend's Twitch Drops Miner",
             "language": "Idioma:",
             "initializing": "Inicializando...",
             "auto_mode": "AUTO",
@@ -202,6 +269,35 @@
         "wanted": {
             "name": "Cola de Drops Deseados",
             "none": "No hay drops deseados en cola..."
+        },
+        "system": {
+            "header": "System",
+            "miner_header": "Miner",
+            "miner_desc": "Reload campaigns and restart the mining loop.",
+            "reload_btn": "Reload Campaigns",
+            "restart_header": "Restart",
+            "restart_desc": "Stop the miner process. PM2 will restart it automatically.",
+            "restart_btn": "Restart Miner",
+            "session_header": "Session",
+            "session_desc": "Log out of the web interface.",
+            "logout_btn": "Logout",
+            "reload_ok": "Campaigns reload triggered.",
+            "restart_confirm": "Restart the miner? PM2 will restart it automatically.",
+            "restart_ok": "Miner stopping — will restart via PM2 in a few seconds.",
+            "accounts_header": "Accounts"
+        },
+        "analytics": {
+            "stats_header": "Drop Statistics",
+            "total_claims": "Total Claims",
+            "games_label": "Games",
+            "last_claim": "Last Claim",
+            "claims_by_game": "Claims by Game",
+            "claims_activity": "Claims Activity",
+            "channel_points": "Channel Points",
+            "refresh": "↻ Refresh",
+            "no_channel_points": "No channel points data yet. Points are recorded while watching channels.",
+            "drop_history": "Drop History",
+            "no_history": "No drops claimed yet."
         }
     }
 }

@@ -20,6 +20,9 @@ settings.json
 logs/
 .claude/
 data/
+data2/
+discord_bot/live_stats.json
+docs/superpowers/
 .ruff_cache/
 .vscode/
 .idea/
@@ -28,5 +31,12 @@ data/
 *.egg-info/
 .coverage
 
-artifacts/.venv/
+artifacts/
 .venv/
+
+# Discord bot secrets
+discord_bot/.env
+discord_bot/pairings.json
+*.bak
+venv/
+web_backup_*/

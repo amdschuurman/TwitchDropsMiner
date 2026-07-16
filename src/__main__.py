@@ -65,6 +65,9 @@ if __name__ == "__main__":
         if settings.language:
             _.set_language(settings.language)
 
+        from src.services import drop_minutes_cache as _dmc
+        _dmc.load()
+
         logger.info("=== TwitchDropsMiner Starting ===")
         logger.info(f"Version: {__version__}")
         logger.info(f"Python version: {sys.version}")
@@ -88,6 +91,7 @@ if __name__ == "__main__":
         webapp.set_managers(client.gui, client)
         # Start web server in background. Default to loopback; opt in to LAN
         # exposure by setting TDM_HOST=0.0.0.0 (or any other interface).
+        # TDM_PORT allows parallel instances to bind distinct ports.
         bind_host = os.environ.get("TDM_HOST", "127.0.0.1")
         bind_port = int(os.environ.get("TDM_PORT", "8080"))
         logger.info(f"Starting web server on http://{bind_host}:{bind_port}")

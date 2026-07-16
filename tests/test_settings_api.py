@@ -25,6 +25,9 @@ class TestSettingsAPI(unittest.IsolatedAsyncioTestCase):
         mock_settings.inventory_filters = {}
         mock_settings.mining_benefits = {}
         mock_settings.games_to_watch = []
+        # update_settings() reads make_predictions unconditionally (predictions
+        # enable-transition detection); real Settings.load() always provides it.
+        mock_settings.make_predictions = False
 
         mock_console = MagicMock()
         mock_callback = MagicMock()

@@ -1,9 +1,41 @@
 import unittest
 from unittest.mock import MagicMock
 
+from src.models.benefit import Benefit, BenefitType
 from src.models.campaign import DropsCampaign
 from src.models.game import Game
 from src.services.stream_selector import StreamSelector
+
+
+def _make_benefit(name, benefit_type):
+    b = MagicMock(spec=Benefit)
+    b.name = name
+    b.type = benefit_type
+    b.image_url = f"http://img/{name}"
+    # Bind the real wantedness logic so mining_benefits filtering is exercised.
+    b.is_wanted = Benefit.is_wanted.__get__(b, Benefit)
+    return b
+
+
+def _make_drop(name, *, is_claimed=False, required_minutes=15, benefits=(), base_can_earn=True):
+    d = MagicMock()
+    d.name = name
+    d.is_claimed = is_claimed
+    d.required_minutes = required_minutes
+    d._base_can_earn.return_value = base_can_earn
+    d.benefits = list(benefits)
+    return d
+
+
+def _make_campaign(cid, game, drops, *, can_earn_within=True):
+    c = MagicMock(spec=DropsCampaign)
+    c.id = cid
+    c.name = f"Campaign {cid}"
+    c.campaign_url = f"http://test.url/{cid}"
+    c.game = game
+    c.can_earn_within.return_value = can_earn_within
+    c.drops = list(drops)
+    return c
 
 
 class TestWantedGamesFilter(unittest.TestCase):
@@ -11,92 +43,92 @@ class TestWantedGamesFilter(unittest.TestCase):
         # Mock Settings
         self.settings = MagicMock()
         self.settings.games_to_watch = ["Game1", "Game2"]
+        self.settings.preferred_games = []
+        self.settings.drop_name_blacklist = []
         self.settings.mining_benefits = {
             "BADGE": True,
             "DIRECT_ENTITLEMENT": True,
         }  # both allowed by default
 
     def test_filter_wanted_campaigns(self):
-        # Setup Campaigns
-
-        # Campaign 1: Game1, Can Earn, Has Wanted Benefits -> Should be selected
-        c1 = MagicMock(spec=DropsCampaign)
-        c1.game = Game({"id": 1, "name": "Game1"})
-        c1.can_earn_within.return_value = True
-        c1.id = "123"
-        c1.name = "Test Campaign"
-        c1.campaign_url = "http://test.url"
-        d1 = MagicMock()
-        d1.name = "Test Drop"
-        d1.is_claimed = False
-        d1.get_wanted_unclaimed_benefits.return_value = ["Benefit1"]
-        c1.drops = [d1]
-        c1.has_wanted_unclaimed_benefits.side_effect = (
-            DropsCampaign.has_wanted_unclaimed_benefits.__get__(c1, DropsCampaign)
+        # Campaign 1: Game1, can earn, has wanted benefit -> should be selected
+        c1 = _make_campaign(
+            "c1",
+            Game({"id": 1, "name": "Game1"}),
+            [_make_drop("Drop1", benefits=[_make_benefit("Benefit1", BenefitType.BADGE)])],
         )
 
-        # Campaign 2: Game2, Can Earn, NO Wanted Benefits -> Should NOT be selected
-        c2 = MagicMock(spec=DropsCampaign)
-        c2.game = Game({"id": 2, "name": "Game2"})
-        c2.can_earn_within.return_value = True
-        d2 = MagicMock()
-        d2.is_claimed = False
-        d2.get_wanted_unclaimed_benefits.return_value = []
-        c2.drops = [d2]
-        c2.has_wanted_unclaimed_benefits.side_effect = (
-            DropsCampaign.has_wanted_unclaimed_benefits.__get__(c2, DropsCampaign)
+        # Campaign 2: Game2, can earn, benefits present but none wanted -> NOT selected
+        # (UNKNOWN distribution type is not in mining_benefits, so is_wanted is False)
+        c2 = _make_campaign(
+            "c2",
+            Game({"id": 2, "name": "Game2"}),
+            [_make_drop("Drop2", benefits=[_make_benefit("Benefit2", BenefitType.UNKNOWN)])],
         )
 
-        # Campaign 3: Game3 (Not in games_to_watch), Can Earn, Has Benefits -> Should NOT be selected
-        c3 = MagicMock(spec=DropsCampaign)
-        c3.game = Game({"id": 3, "name": "Game3"})
-        c3.can_earn_within.return_value = True
-        d3 = MagicMock()
-        d3.is_claimed = False
-        d3.get_wanted_unclaimed_benefits.return_value = ["Benefit3"]
-        c3.drops = [d3]
-        c3.has_wanted_unclaimed_benefits.side_effect = (
-            DropsCampaign.has_wanted_unclaimed_benefits.__get__(c3, DropsCampaign)
+        # Campaign 3: Game3 (not in games_to_watch), can earn, wanted benefit -> NOT selected
+        c3 = _make_campaign(
+            "c3",
+            Game({"id": 3, "name": "Game3"}),
+            [_make_drop("Drop3", benefits=[_make_benefit("Benefit3", BenefitType.BADGE)])],
         )
 
-        # Campaign 4: Game1, Can Earn, Has Claimed Wanted Benefits -> Should NOT be selected
-        c4 = MagicMock(spec=DropsCampaign)
-        c4.game = Game({"id": 1, "name": "Game1"})
-        c4.can_earn_within.return_value = True
-        c4.id = "123"
-        c4.name = "Test Campaign"
-        c4.campaign_url = "http://test.url"
-        d4 = MagicMock()
-        d4.name = "Test Drop"
-        d4.is_claimed = True
-        d4.get_wanted_unclaimed_benefits.return_value = ["Benefit4"]
-        c4.drops = [d4]
-        c4.has_wanted_unclaimed_benefits.side_effect = (
-            DropsCampaign.has_wanted_unclaimed_benefits.__get__(c4, DropsCampaign)
+        # Campaign 4: Game1, can earn, wanted benefit but drop already claimed -> NOT selected
+        c4 = _make_campaign(
+            "c4",
+            Game({"id": 1, "name": "Game1"}),
+            [
+                _make_drop(
+                    "Drop4",
+                    is_claimed=True,
+                    benefits=[_make_benefit("Benefit4", BenefitType.BADGE)],
+                )
+            ],
         )
 
-        # Campaign 5: Game1, Can Not Earn, Has Wanted Benefits -> Should NOT be selected
-        c5 = MagicMock(spec=DropsCampaign)
-        c5.game = Game({"id": 1, "name": "Game1"})
-        c5.can_earn_within.return_value = False
-        c5.id = "123"
-        c5.name = "Test Campaign"
-        c5.campaign_url = "http://test.url"
-        d5 = MagicMock()
-        d5.name = "Test Drop"
-        d5.is_claimed = False
-        d5.get_wanted_unclaimed_benefits.return_value = ["Benefit5"]
-        c5.drops = [d5]
-        c5.has_wanted_unclaimed_benefits.side_effect = (
-            DropsCampaign.has_wanted_unclaimed_benefits.__get__(c5, DropsCampaign)
+        # Campaign 5: Game1, can NOT earn within the next hour, wanted benefit -> NOT selected
+        c5 = _make_campaign(
+            "c5",
+            Game({"id": 1, "name": "Game1"}),
+            [_make_drop("Drop5", benefits=[_make_benefit("Benefit5", BenefitType.BADGE)])],
+            can_earn_within=False,
         )
 
-        inventory = [c1, c2, c3, c4, c5]
+        # Campaign 6: Game1, can earn, wanted benefit but zero watch-time required
+        # (required_minutes <= 0 drops are excluded) -> NOT selected
+        c6 = _make_campaign(
+            "c6",
+            Game({"id": 1, "name": "Game1"}),
+            [
+                _make_drop(
+                    "Drop6",
+                    required_minutes=0,
+                    benefits=[_make_benefit("Benefit6", BenefitType.BADGE)],
+                )
+            ],
+        )
+
+        # Campaign 7: Game2, can earn, wanted benefit but drop not currently earnable
+        # (_base_can_earn False, e.g. preconditions unmet or outside timeframe) -> NOT selected
+        c7 = _make_campaign(
+            "c7",
+            Game({"id": 2, "name": "Game2"}),
+            [
+                _make_drop(
+                    "Drop7",
+                    base_can_earn=False,
+                    benefits=[_make_benefit("Benefit7", BenefitType.BADGE)],
+                )
+            ],
+        )
+
+        inventory = [c1, c2, c3, c4, c5, c6, c7]
         stream_selector = StreamSelector()
         wanted_games = stream_selector.get_wanted_games(self.settings, inventory)
 
         self.assertEqual(len(wanted_games), 1)
         self.assertEqual(wanted_games[0].name, "Game1")
+        self.assertIs(wanted_games[0], c1.game)
 
 
 if __name__ == "__main__":

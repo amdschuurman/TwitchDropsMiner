@@ -15,6 +15,11 @@ class TestProxySettings(unittest.TestCase):
         # Create a pure mock Settings without wrapping a real instance
         # This avoids file I/O during tests
         self.mock_settings = MagicMock(spec=Settings)
+        # Settings' dataclass fields are annotation-only (populated by load() at
+        # runtime), so spec= can't see them; update_settings() reads
+        # make_predictions unconditionally to detect the enable transition.
+        # Mirror the real default (default_settings["make_predictions"] = False).
+        self.mock_settings.make_predictions = False
         self.mock_console = MagicMock(spec=ConsoleOutputManager)
 
         # Mock asyncio.create_task

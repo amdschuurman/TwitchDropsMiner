@@ -13,7 +13,7 @@ from contextlib import suppress
 from time import time
 from typing import TYPE_CHECKING, NoReturn
 
-from src.config import CALL, GQL_OPERATIONS, WATCH_INTERVAL
+from src.config import CALL, GQL_OPERATIONS, WATCH_INTERVAL, WebsocketTopic
 from src.exceptions import GQLException, MinerException, RequestException
 from src.i18n import _
 from src.utils import task_wrapper
@@ -27,6 +27,17 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("TwitchDrops")
+
+
+async def _send_idle_watch(channel) -> None:
+    if not channel.online:
+        return
+    succeeded = await channel.send_watch()
+    if succeeded:
+        broadcast_id = channel._stream.broadcast_id if channel._stream else "none"
+        logger.info(f"Watch sent OK (idle): {channel.name} (broadcast_id={broadcast_id})")
+    else:
+        logger.log(CALL, f"Watch requested failed for idle channel: {channel.name}")
 
 
 class WatchService:
@@ -123,6 +134,44 @@ class WatchService:
         """
         self._twitch.gui.channels.set_watching(channel)
         self._twitch.watching_channel.set(channel)
+        # Subscribe CommunityPoints for this channel (only if enabled, 1 topic = safe)
+        if self._twitch.settings.claim_channel_points:
+            prev = self._twitch._watching_cp_topic_id
+            new_topic_id = WebsocketTopic.as_str("Channel", "CommunityPoints", channel.id)
+            if prev != new_topic_id:
+                if prev:
+                    self._twitch.websocket.remove_topics([prev])
+                try:
+                    self._twitch.websocket.add_topics([
+                        WebsocketTopic(
+                            "Channel",
+                            "CommunityPoints",
+                            channel.id,
+                            self._twitch._message_handler_service.process_community_points,
+                        )
+                    ])
+                    self._twitch._watching_cp_topic_id = new_topic_id
+                except MinerException:
+                    logger.warning(f"Topic limit reached — CommunityPoints not subscribed for {channel.name}")
+        if self._twitch.settings.claim_moments:
+            try:
+                self._twitch.websocket.add_topics([WebsocketTopic(
+                    "Channel", "Moments", channel.id,
+                    self._twitch._message_handler_service.process_moments,
+                )])
+            except MinerException:
+                logger.warning(f"Topic limit — Moments topic skipped for {channel.name}")
+        if self._twitch.settings.make_predictions:
+            whitelist = [c.lower() for c in self._twitch.settings.prediction_channels]
+            if not whitelist or channel.name.lower() in whitelist:
+                try:
+                    self._twitch.websocket.add_topics([WebsocketTopic(
+                        "Channel", "Predictions", channel.id,
+                        self._twitch._prediction_service.process_prediction,
+                    )])
+                    logger.info(f"Predictions subscribed for {channel.name}")
+                except MinerException:
+                    logger.warning(f"Topic limit — Predictions topic skipped for {channel.name}")
 
         if update_status:
             # Check if manual mode is active for custom status message
@@ -132,6 +181,29 @@ class WatchService:
                 status_text = _.t["status"]["watching"].format(channel=channel.name)
             self._twitch.print(status_text)
             self._twitch.gui.status.update(status_text)
+
+    def subscribe_predictions_now(self) -> None:
+        idle_parallel = getattr(self._twitch.settings, "idle_parallel", True)
+        idle_set = self._twitch._idle_channels_set
+        if idle_parallel and idle_set:
+            channels = [ch for ch in idle_set if ch.online]
+        else:
+            ch = self._twitch.watching_channel.get_with_default(None)
+            channels = [ch] if ch is not None else []
+
+        whitelist = [c.lower() for c in self._twitch.settings.prediction_channels]
+        for ch in channels:
+            if whitelist and ch.name.lower() not in whitelist:
+                continue
+            try:
+                self._twitch.websocket.add_topics([WebsocketTopic(
+                    "Channel", "Predictions", ch.id,
+                    self._twitch._prediction_service.process_prediction,
+                )])
+                logger.info(f"Predictions subscribed live for {ch.name}")
+            except MinerException:
+                logger.warning(f"Topic limit — Predictions skipped for {ch.name}")
+                break
 
     def stop_watching(self) -> None:
         """
@@ -183,6 +255,8 @@ class WatchService:
         by falling back to GQL queries or minute bumping.
         """
         interval: float = WATCH_INTERVAL.total_seconds()
+        _cp_poll_counter: int = 0
+        _CP_POLL_EVERY: int = 3  # poll every ~3 iterations ≈ 60s
 
         while True:
             channel: Channel = await self._twitch.watching_channel.get()
@@ -198,6 +272,19 @@ class WatchService:
 
             if not succeeded:
                 logger.log(CALL, f"Watch requested failed for channel: {channel.name}")
+            else:
+                logger.info(f"Watch sent OK: {channel.name} (broadcast_id={channel._stream.broadcast_id if channel._stream else 'none'})")
+
+            # Multi-channel idle: also send watch to all other idle channels
+            # Only do this when parallel idle is explicitly enabled — avoids spurious
+            # "Watch sent OK" logs for a second channel when parallel is OFF (Bug 1).
+            idle_parallel = getattr(self._twitch.settings, "idle_parallel", True)
+            idle_set = self._twitch._idle_channels_set
+            if idle_parallel and idle_set:
+                for idle_ch in list(idle_set):
+                    if idle_ch is channel or not idle_ch.online:
+                        continue
+                    asyncio.create_task(_send_idle_watch(idle_ch))
 
             # wait ~20 seconds for a progress update
             await asyncio.sleep(20)
@@ -256,5 +343,30 @@ class WatchService:
                         handled = True
                     else:
                         logger.log(CALL, "No active drop could be determined")
+
+            # Periodic channel points poll (every ~60s) — covers the primary
+            # channel plus any other channels being watched in parallel idle mode,
+            # since the websocket push (process_community_points) can miss claims.
+            _cp_poll_counter += 1
+            if (
+                _cp_poll_counter >= _CP_POLL_EVERY
+                and self._twitch.settings.claim_channel_points
+            ):
+                _cp_poll_counter = 0
+                asyncio.create_task(
+                    self._twitch._message_handler_service._emit_channel_points(
+                        channel._login, channel.id
+                    )
+                )
+                idle_parallel = getattr(self._twitch.settings, "idle_parallel", True)
+                if idle_parallel:
+                    for idle_ch in list(self._twitch._idle_channels_set):
+                        if idle_ch is channel or not idle_ch.online:
+                            continue
+                        asyncio.create_task(
+                            self._twitch._message_handler_service._emit_channel_points(
+                                idle_ch._login, idle_ch.id
+                            )
+                        )
 
             await self.watch_sleep(interval - min(time() - last_sent, interval))

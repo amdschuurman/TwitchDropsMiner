@@ -13,6 +13,7 @@ import aiohttp
 from src.api import GQLClient, HTTPClient
 from src.auth import _AuthState
 from src.config import (
+    GQL_OPERATIONS,
     MAX_CHANNELS,
     ClientType,
     State,
@@ -29,9 +30,13 @@ from src.i18n import _
 from src.models.campaign import DropsCampaign
 from src.models.channel import Channel
 from src.services.channel_service import ChannelService
+from src.services.drop_history import save_drop_claim
 from src.services.inventory_service import InventoryService
+from src.services.irc_service import IRCService
 from src.services.maintenance import MaintenanceService
 from src.services.message_handlers import MessageHandlerService
+from src.services.prediction_service import PredictionService
+from src.services.scheduler_service import SchedulerService
 from src.services.stream_selector import StreamSelector
 from src.services.watch_service import WatchService
 from src.utils import (
@@ -63,6 +68,7 @@ class Twitch:
         self.inventory: list[DropsCampaign] = []
         self._drops: dict[str, TimedDrop] = {}
         self._campaigns: dict[str, DropsCampaign] = {}
+        self._webhook_sent_drops: set[str] = set()
         self._mnt_triggers: deque[datetime] = deque()
         # Client type and auth
         self._client_type: ClientInfo = ClientType.ANDROID_APP
@@ -75,6 +81,9 @@ class Twitch:
         # Storing and watching channels
         self.channels: OrderedDict[int, Channel] = OrderedDict()
         self.watching_channel: AwaitableValue[Channel] = AwaitableValue()
+        self._idle_topic_ids: list[str] = []
+        self._idle_channels_set: set = set()  # all channels currently watched in idle mode
+        self._watching_cp_topic_id: str = ""  # CommunityPoints topic for current watching channel
         self._watching_task: asyncio.Task[None] | None = None
         self._watching_restart = asyncio.Event()
         # Manual mode tracking
@@ -91,6 +100,18 @@ class Twitch:
         self._inventory_service: InventoryService = InventoryService(self)
         self._watch_service: WatchService = WatchService(self)
         self._stream_selector: StreamSelector = StreamSelector()
+        # Pause/resume state (PR #65)
+        self._is_paused: bool = False
+        self._pause_source: str | None = None
+        self._user_override: bool = False
+        self._scheduler_task: asyncio.Task[None] | None = None
+        self._scheduler_service: SchedulerService = SchedulerService(self)
+        from src.services.campaign_alert_service import CampaignAlertService
+        self._campaign_alert_service: CampaignAlertService = CampaignAlertService(self)
+        self._irc_service: IRCService = IRCService(self)
+        self._prediction_service: PredictionService = PredictionService(self)
+        # Skip game tracking (set grows until all games tried, then resets)
+        self._skipped_games: set[Game] = set()
 
     def _ensure_api_clients(self) -> None:
         """Ensure API clients are initialized (called after GUI is set)."""
@@ -128,8 +149,12 @@ class Twitch:
         if self._mnt_task is not None:
             self._mnt_task.cancel()
             self._mnt_task = None
+        if self._scheduler_task is not None:
+            self._scheduler_task.cancel()
+            self._scheduler_task = None
         # stop websocket and close HTTP session
         await self.websocket.stop(clear_topics=True)
+        await self._irc_service.stop()
         if self._http_client is not None:
             await self._http_client.close()
         self._drops.clear()
@@ -157,12 +182,42 @@ class Twitch:
         """Return a callable that changes state when invoked (deferred call for GUI usage)."""
         return partial(self.change_state, state)
 
+    def skip_current_game(self) -> None:
+        """Skip the current game; accumulates skipped games until all tried, then resets."""
+        watching_channel = self.watching_channel.get_with_default(None)
+        if watching_channel is not None and watching_channel.game is not None:
+            self._skipped_games.add(watching_channel.game)
+        self.change_state(State.CHANNEL_SWITCH)
+
     def close(self) -> None:
         """
         Called when the application is requested to close by the user,
         usually by the console or application window being closed.
         """
         self.change_state(State.EXIT)
+
+    def pause(self, source: str = "user") -> None:
+        """Pause the miner."""
+        if source == "user":
+            self._user_override = True
+        self._is_paused = True
+        self._pause_source = source
+        self.change_state(State.PAUSED)
+        asyncio.create_task(self.gui.broadcast_pause_state(True))
+
+    def resume(self, *, user_override: bool = False) -> None:
+        """Resume the miner."""
+        if user_override:
+            self._user_override = True
+            self._pause_source = None
+        self._is_paused = False
+        self._pause_source = None
+        self.change_state(State.INVENTORY_FETCH)
+        asyncio.create_task(self.gui.broadcast_pause_state(False))
+
+    def is_paused(self) -> bool:
+        """Return whether the miner is currently paused."""
+        return self._is_paused
 
     def print(self, message: str) -> None:
         """Print a message in the GUI."""
@@ -227,10 +282,19 @@ class Twitch:
         self._ensure_api_clients()
         auth_state = await self.get_auth()
         await self.websocket.start()
+        # NOTE: run() may re-enter _run() after a transient failure (recovery
+        # backoff), so stop any previous IRC connect loop before starting a
+        # fresh one - otherwise each re-entry would leak an IRC connection.
+        await self._irc_service.stop()
+        await self._irc_service.start()
         # NOTE: watch task is explicitly restarted on each new run
         if self._watching_task is not None:
             self._watching_task.cancel()
         self._watching_task = asyncio.create_task(self._watch_service.watch_loop())
+        # Start scheduler service
+        if self._scheduler_task is not None:
+            self._scheduler_task.cancel()
+        self._scheduler_task = asyncio.create_task(self._scheduler_service.run_scheduler())
         # Add default topics
         self.websocket.add_topics(
             [
@@ -245,17 +309,97 @@ class Twitch:
                 ),
             ]
         )
+        if self.settings.idle_use_followed:
+            followed = await self._fetch_followed_channels()
+            existing = {ch.lower() for ch in self.settings.idle_channels}
+            for login in followed:
+                if login not in existing:
+                    self.settings.idle_channels.append(login)
+                    existing.add(login)
+            logger.info(f"Follower import: added {len(followed)} channels to idle pool")
         full_cleanup: bool = False
         channels: Final[OrderedDict[int, Channel]] = self.channels
         self.change_state(State.INVENTORY_FETCH)
         while True:
-            if self._state is State.IDLE:
+            if self._state is State.PAUSED:
+                self.gui.status.update("⏸ Mining paused")
+                self.stop_watching()
+                # fall through to the bottom wait - resume() wakes us up
+            elif self._state is State.IDLE:
                 self.gui.status.update(_.t["gui"]["status"]["idle"])
                 self.stop_watching()
+                # Remove any previously added idle channel topics to prevent accumulation
+                if self._idle_topic_ids:
+                    self.websocket.remove_topics(self._idle_topic_ids)
+                    self._idle_topic_ids = []
+                # Try idle watch if channels are configured or followed auto-mode is on
+                self._idle_channels_set = set()
+                if self.settings.idle_channels or self.settings.idle_use_followed:
+                    logger.info(f"Idle watch: trying channels {self.settings.idle_channels}")
+                    idle_parallel = getattr(self.settings, "idle_parallel", True)
+                    if idle_parallel:
+                        idle_chs = await self._fetch_all_idle_channels()
+                    else:
+                        single = await self._fetch_idle_channel()
+                        idle_chs = [single] if single else []
+                    if idle_chs:
+                        self._idle_channels_set = set(idle_chs)
+                        names = ", ".join(ch.name for ch in idle_chs)
+                        logger.info(f"Idle watch: watching {len(idle_chs)} channel(s): {names}")
+                        self.gui.status.update(f"💤 Idle: {names}")
+                        # Use first channel as primary for display/watch_loop
+                        self.watch(idle_chs[0], update_status=False)
+                        idle_topics: list[WebsocketTopic] = [
+                            WebsocketTopic(
+                                "Channel",
+                                "StreamState",
+                                ch.id,
+                                self._message_handler_service.process_idle_stream_state,
+                            )
+                            for ch in idle_chs
+                        ]
+                        self._idle_topic_ids = [str(t) for t in idle_topics]
+                        self.websocket.add_topics(idle_topics)
+                        logger.info(f"Idle watch: subscribed StreamState for {names}")
+                        # Subscribe CommunityPoints for all additional idle channels
+                        if self.settings.claim_channel_points:
+                            for ch in idle_chs[1:]:
+                                cp_topic_id = WebsocketTopic.as_str("Channel", "CommunityPoints", ch.id)
+                                if cp_topic_id not in self._idle_topic_ids:
+                                    try:
+                                        self.websocket.add_topics([WebsocketTopic(
+                                            "Channel", "CommunityPoints", ch.id,
+                                            self._message_handler_service.process_community_points,
+                                        )])
+                                        self._idle_topic_ids.append(cp_topic_id)
+                                    except Exception:
+                                        logger.warning(f"CP topic limit — skipping {ch.name}")
+                        # Bug 3 fix: subscribe Predictions for ALL parallel idle channels
+                        # (not just the primary — ch[0] already gets Predictions via watch()).
+                        if self.settings.make_predictions:
+                            pred_whitelist = [c.lower() for c in self.settings.prediction_channels]
+                            for ch in idle_chs[1:]:
+                                if pred_whitelist and ch.name.lower() not in pred_whitelist:
+                                    continue
+                                pred_topic_id = WebsocketTopic.as_str("Channel", "Predictions", ch.id)
+                                if pred_topic_id not in self._idle_topic_ids:
+                                    try:
+                                        self.websocket.add_topics([WebsocketTopic(
+                                            "Channel", "Predictions", ch.id,
+                                            self._prediction_service.process_prediction,
+                                        )])
+                                        self._idle_topic_ids.append(pred_topic_id)
+                                    except Exception:
+                                        logger.warning(f"Predictions topic limit — skipping {ch.name}")
+                    else:
+                        logger.info("Idle watch: no idle channels online")
             elif self._state is State.INVENTORY_FETCH:
                 # ensure the websocket is running
                 await self.websocket.start()
                 await self.fetch_inventory()
+                asyncio.create_task(
+                    self._campaign_alert_service.check_and_alert(list(self.inventory))
+                )
                 self.gui.set_games({campaign.game for campaign in self.inventory})
                 # Broadcast unwanted items (based on settings)
                 self.gui.broadcast_wanted_items()
@@ -268,8 +412,54 @@ class Twitch:
                 for campaign in self.inventory:
                     if not campaign.upcoming:
                         for drop in campaign.drops:
+                            # If drop is fully complete but has no claim_id (WebSocket missed),
+                            # generate a synthetic claim_id so can_claim returns True
+                            if (
+                                not drop.is_claimed
+                                and drop.claim_id is None
+                                and hasattr(drop, "progress")
+                                and drop.progress >= 1.0
+                            ):
+                                logger.info(f"Generating synthetic claim_id for completed drop: {drop.id}")
+                                await drop.generate_claim()
                             if drop.can_claim:
-                                await drop.claim()
+                                claimed = await drop.claim()
+                                if claimed:
+                                    webhook_url = self.settings.discord_webhook_drops
+                                    if webhook_url and drop.id not in self._webhook_sent_drops:
+                                        self._webhook_sent_drops.add(drop.id)
+                                        import json as _json_wh
+                                        from src.config import DATA_DIR as _DATA_DIR_WH
+                                        _wcfg_wh = _DATA_DIR_WH / "web_config.json"
+                                        try:
+                                            _acct_wh = _json_wh.loads(_wcfg_wh.read_text()).get("active_account", "") if _wcfg_wh.exists() else ""
+                                        except Exception:
+                                            _acct_wh = ""
+                                        embed: dict = {
+                                            "title": "🎁 Drop Claimed!",
+                                            "color": 0x9147ff,
+                                            "fields": [
+                                                {"name": "Game", "value": campaign.game.name, "inline": True},
+                                                {"name": "Drop", "value": drop.name, "inline": True},
+                                                {"name": "Reward", "value": drop.rewards_text(), "inline": False},
+                                            ],
+                                        }
+                                        if _acct_wh:
+                                            embed["footer"] = {"text": f"Account: {_acct_wh}"}
+                                        if drop.benefits:
+                                            embed["thumbnail"] = {"url": drop.benefits[0].image_url}
+                                        asyncio.create_task(
+                                            self._message_handler_service._send_discord_webhook(
+                                                webhook_url, {"embeds": [embed]}
+                                            )
+                                        )
+                                    # Save to drop history
+                                    save_drop_claim(
+                                        campaign.game.name,
+                                        drop.name,
+                                        drop.rewards_text(),
+                                        drop.benefits[0].image_url if drop.benefits else None,
+                                    )
                 # figure out which games we want based on games_to_watch whitelist
                 self.wanted_games.clear()
                 games_to_watch: list[str] = self.settings.games_to_watch
@@ -383,7 +573,10 @@ class Twitch:
                 for game in no_acl:
                     # for every campaign without an ACL, for it's game,
                     # add a list of live channels with drops enabled
-                    new_channels.update(await self.get_live_streams(game, drops_enabled=True))
+                    try:
+                        new_channels.update(await self.get_live_streams(game, drops_enabled=True))
+                    except Exception as exc:
+                        logger.warning(f"Failed to fetch channels for {game.name}: {exc} — skipping")
                 # sort them descending by viewers, by priority and by game priority
                 # NOTE: Viewers sort also ensures ONLINE channels are sorted to the top
                 # NOTE: We can drop using the set now, because there's no more channels being added
@@ -426,7 +619,10 @@ class Twitch:
                             self._message_handler_service.process_stream_update,
                         )
                     )
-                self.websocket.add_topics(to_add_topics)
+                try:
+                    self.websocket.add_topics(to_add_topics)
+                except MinerException:
+                    logger.warning("Topic limit reached — too many channels, some won't be tracked")
                 # relink watching channel after cleanup
                 # NOTE: this replaces 'self.watching_channel's internal value with the new object
                 # Don't call stop_watching() here - let CHANNEL_SWITCH handle it to avoid clearing drop display
@@ -494,16 +690,46 @@ class Twitch:
                             self.exit_manual_mode("No channels available for manual game")
                 # Auto-select best channel based on priority
                 else:
-                    for channel in sorted(
-                        channels.values(), key=self._channel_service.get_priority
-                    ):
-                        if self.can_watch(channel) and self.should_switch(channel):
-                            new_watching = channel
-                            break
+                    skipped = self._skipped_games
+
+                    def _streak_key(ch: Channel) -> int:
+                        return 0 if self._stream_selector._has_unclaimed_streak_today(ch.name) else 1
+
+                    if skipped:
+                        # Skip mode: find channel from a game not yet skipped
+                        watchable = sorted(
+                            channels.values(), key=self._channel_service.get_priority
+                        )
+                        watchable = sorted(watchable, key=_streak_key)
+                        for channel in watchable:
+                            if self.can_watch(channel) and channel.game not in skipped:
+                                new_watching = channel
+                                break
+                        # All games skipped → reset and pick best available
+                        if new_watching is None:
+                            self._skipped_games.clear()
+                            watchable = sorted(
+                                channels.values(), key=self._channel_service.get_priority
+                            )
+                            watchable = sorted(watchable, key=_streak_key)
+                            for channel in watchable:
+                                if self.can_watch(channel):
+                                    new_watching = channel
+                                    break
+                    else:
+                        watchable = sorted(
+                            channels.values(), key=self._channel_service.get_priority
+                        )
+                        watchable = sorted(watchable, key=_streak_key)
+                        for channel in watchable:
+                            if self.can_watch(channel) and self.should_switch(channel):
+                                new_watching = channel
+                                break
 
                 if new_watching is not None:
                     # Switch to new channel
                     self.watch(new_watching)
+                    asyncio.create_task(self._irc_service.join(new_watching.name))
                     # Display the active drop for the new channel
                     if (active_campaign := self.get_active_campaign(new_watching)) is not None and (
                         active_drop := active_campaign.first_drop
@@ -529,8 +755,122 @@ class Twitch:
             # Wait for the next state change. clear() runs after wait so any
             # change_state() emitted during processing isn't lost. Each iteration
             # snapshots the latest self._state at the top of the loop.
-            await self._state_change.wait()
+            if self._state is State.IDLE and not self._idle_topic_ids:
+                # nothing to idle-watch: refresh campaigns hourly so newly
+                # started campaigns get picked up without a state change
+                try:
+                    await asyncio.wait_for(self._state_change.wait(), timeout=3600)
+                except asyncio.TimeoutError:
+                    logger.info("Idle for 1 hour — refreshing campaigns")
+                    self.change_state(State.INVENTORY_FETCH)
+            else:
+                await self._state_change.wait()
             self._state_change.clear()
+
+    async def _fetch_followed_channels(self) -> list[str]:
+        try:
+            resp = await self.gql_request(GQL_OPERATIONS["FollowedChannels"])
+            edges = (
+                resp.get("data", {})
+                .get("currentUser", {})
+                .get("follows", {})
+                .get("edges", [])
+            )
+            return [e["node"]["login"].lower() for e in edges if e.get("node", {}).get("login")]
+        except Exception as e:
+            logger.warning(f"Failed to fetch followed channels: {e}")
+            return []
+
+    async def _fetch_followed_live_logins(self) -> list[str]:
+        """Fetch logins of live followed channels via Helix; falls back to GQL on 401."""
+        try:
+            auth = await self.get_auth()
+            user_id = auth.user_id
+            client_id = self._client_type.CLIENT_ID
+            access_token = auth.access_token
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Client-Id": client_id,
+            }
+            logins: list[str] = []
+            cursor: str | None = None
+            helix_ok = True
+            for _ in range(5):
+                url = f"https://api.twitch.tv/helix/streams/followed?user_id={user_id}&first=100"
+                if cursor:
+                    url += f"&after={cursor}"
+                async with self._http_client.request("GET", url, headers=headers) as resp:
+                    if resp.status == 401:
+                        helix_ok = False
+                        break
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning(f"Idle (followed): Helix returned {resp.status}: {body[:200]}")
+                        break
+                    data = await resp.json()
+                logins.extend(s["user_login"] for s in data.get("data", []))
+                cursor = data.get("pagination", {}).get("cursor")
+                if not cursor:
+                    break
+            if helix_ok:
+                logger.info(f"Idle (followed): {len(logins)} live followed channels")
+                return logins
+            # Helix 401 — token lacks user:read:follows scope, fall back to GQL
+            logger.info("Idle (followed): Helix 401, falling back to GQL followed list")
+            return await self._fetch_followed_channels()
+        except Exception as exc:
+            logger.warning(f"Could not fetch followed live channels: {exc}")
+            return []
+
+    async def _fetch_idle_channel_by_login(self, login: str) -> Channel | None:
+        """Fetch a specific channel by login and return it if online."""
+        from src.models.channel import Stream
+        try:
+            response = await self.gql_request(
+                GQL_OPERATIONS["GetStreamInfo"].with_variables({"channel": login})
+            )
+            user_data = response["data"]["user"]
+            if not user_data or not user_data.get("stream"):
+                return None
+            channel = Channel(self, id=user_data["id"], login=login, display_name=user_data.get("displayName"))
+            channel._stream = Stream.from_get_stream(channel, user_data)
+            return channel
+        except Exception as exc:
+            logger.debug(f"Idle channel fetch failed for {login}: {exc}")
+            return None
+
+    async def _fetch_idle_channel(self) -> Channel | None:
+        """Return the first online idle channel (manual list + optionally followed)."""
+        logins: list[str] = list(self.settings.idle_channels)
+        if self.settings.idle_use_followed:
+            followed = await self._fetch_followed_live_logins()
+            seen = set(logins)
+            for login in followed:
+                if login not in seen:
+                    logins.append(login)
+                    seen.add(login)
+        for login in logins:
+            channel = await self._fetch_idle_channel_by_login(login)
+            if channel is not None:
+                return channel
+        return None
+
+    async def _fetch_all_idle_channels(self) -> list:
+        """Return ALL online idle channels (for parallel idle watching)."""
+        logins: list[str] = list(self.settings.idle_channels)
+        if self.settings.idle_use_followed:
+            followed = await self._fetch_followed_live_logins()
+            seen = set(logins)
+            for login in followed:
+                if login not in seen:
+                    logins.append(login)
+                    seen.add(login)
+        results = []
+        for login in logins:
+            channel = await self._fetch_idle_channel_by_login(login)
+            if channel is not None:
+                results.append(channel)
+        return results
 
     def can_watch(self, channel: Channel) -> bool:
         """Delegate to WatchService."""
@@ -546,6 +886,9 @@ class Twitch:
 
     def stop_watching(self) -> None:
         """Delegate to WatchService."""
+        _ch = self.watching_channel.get_with_default(None)
+        if _ch is not None:
+            asyncio.create_task(self._irc_service.part(_ch.name))
         self._watch_service.stop_watching()
 
     def restart_watching(self) -> None:
@@ -569,6 +912,7 @@ class Twitch:
 
         self._manual_target_channel = channel
         self._manual_target_game = channel.game
+        self._skipped_games.clear()
         logger.info(f"Entered manual mode for game: {channel.game.name}, channel: {channel.name}")
 
         # Broadcast manual mode change to GUI

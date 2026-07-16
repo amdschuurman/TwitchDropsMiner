@@ -33,11 +33,15 @@ class SettingsManager:
         settings: Settings,
         console: ConsoleOutputManager,
         on_change: Callable[[], None] | None = None,
+        on_scheduler_change: Callable[[], None] | None = None,
+        on_predictions_enable: Callable[[], None] | None = None,
     ):
         self._broadcaster = broadcaster
         self._settings = settings
         self._console = console
         self._on_change = on_change
+        self._on_scheduler_change = on_scheduler_change
+        self._on_predictions_enable = on_predictions_enable
         self._available_games: list[str] = []
 
     def get_settings(self) -> dict[str, Any]:
@@ -100,6 +104,87 @@ class SettingsManager:
         )
         should_trigger_update |= self.check_and_update_setting(
             "mining_benefits", settings_data.get("mining_benefits"), True
+        )
+        self.check_and_update_setting(
+            "claim_channel_points", settings_data.get("claim_channel_points")
+        )
+        self.check_and_update_setting(
+            "idle_channels", settings_data.get("idle_channels")
+        )
+        self.check_and_update_setting(
+            "idle_use_followed", settings_data.get("idle_use_followed")
+        )
+        self.check_and_update_setting(
+            "idle_parallel", settings_data.get("idle_parallel")
+        )
+        self.check_and_update_setting(
+            "preferred_games", settings_data.get("preferred_games")
+        )
+        self.check_and_update_setting("scheduler_enabled", settings_data.get("scheduler_enabled"))
+        self.check_and_update_setting("scheduler_start", settings_data.get("scheduler_start"))
+        self.check_and_update_setting("scheduler_stop", settings_data.get("scheduler_stop"))
+        if any(k in settings_data for k in ("scheduler_enabled", "scheduler_start", "scheduler_stop")):
+            if self._on_scheduler_change:
+                self._on_scheduler_change()
+        self.check_and_update_setting(
+            "discord_webhook_drops", settings_data.get("discord_webhook_drops")
+        )
+        self.check_and_update_setting(
+            "discord_webhook_points", settings_data.get("discord_webhook_points")
+        )
+        self.check_and_update_setting(
+            "discord_webhook_mentions", settings_data.get("discord_webhook_mentions")
+        )
+        self.check_and_update_setting(
+            "drop_name_blacklist", settings_data.get("drop_name_blacklist")
+        )
+        self.check_and_update_setting(
+            "auto_prioritize", settings_data.get("auto_prioritize")
+        )
+        self.check_and_update_setting(
+            "auto_add_linked", settings_data.get("auto_add_linked")
+        )
+        self.check_and_update_setting(
+            "tab_counter_enabled", settings_data.get("tab_counter_enabled")
+        )
+        prev_predictions = self._settings.make_predictions
+        self.check_and_update_setting(
+            "make_predictions", settings_data.get("make_predictions")
+        )
+        if not prev_predictions and self._settings.make_predictions and self._on_predictions_enable:
+            self._on_predictions_enable()
+        self.check_and_update_setting(
+            "bet_strategy", settings_data.get("bet_strategy")
+        )
+        self.check_and_update_setting(
+            "bet_percentage", settings_data.get("bet_percentage")
+        )
+        self.check_and_update_setting(
+            "bet_max_points", settings_data.get("bet_max_points")
+        )
+        self.check_and_update_setting(
+            "bet_minimum_points", settings_data.get("bet_minimum_points")
+        )
+        self.check_and_update_setting(
+            "bet_percentage_gap", settings_data.get("bet_percentage_gap")
+        )
+        self.check_and_update_setting(
+            "bet_delay_seconds", settings_data.get("bet_delay_seconds")
+        )
+        self.check_and_update_setting(
+            "prediction_channels", settings_data.get("prediction_channels")
+        )
+        self.check_and_update_setting(
+            "channel_strategies", settings_data.get("channel_strategies")
+        )
+        self.check_and_update_setting(
+            "claim_moments", settings_data.get("claim_moments")
+        )
+        self.check_and_update_setting(
+            "irc_chat_presence", settings_data.get("irc_chat_presence")
+        )
+        self.check_and_update_setting(
+            "irc_mention_notify", settings_data.get("irc_mention_notify")
         )
 
         self._settings.save()

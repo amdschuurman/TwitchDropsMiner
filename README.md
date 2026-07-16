@@ -1,216 +1,200 @@
-# 🌟 Twitch Drops Miner (TDM)
+# Arend's Twitch Drops Miner
 
-> 🎮 **Automate Twitch Drop Farming — Effortlessly, Headlessly, and Bandwidth-Free**
+Mines Twitch drops without downloading stream video: the miner sends the same
+watch events a browser would, tracks campaign progress, claims finished drops,
+and switches channels automatically. Everything is managed from a web dashboard.
 
-<p align="center">
-  <a href="https://github.com/rangermix/TwitchDropsMiner/stargazers"><img src="https://img.shields.io/github/stars/rangermix/TwitchDropsMiner?style=for-the-badge&color=yellow" alt="Stars"></a>
-  <a href="https://github.com/rangermix/TwitchDropsMiner/releases"><img src="https://img.shields.io/github/v/release/rangermix/TwitchDropsMiner?style=for-the-badge&color=brightgreen" alt="Release"></a>
-  <a href="https://hub.docker.com/r/rangermix/twitch-drops-miner"><img src="https://img.shields.io/docker/pulls/rangermix/twitch-drops-miner?style=for-the-badge&color=blue" alt="Docker Pulls"></a>
-  <a href="https://github.com/rangermix/TwitchDropsMiner/blob/main/LICENSE"><img src="https://img.shields.io/github/license/rangermix/TwitchDropsMiner?style=for-the-badge&color=orange" alt="License"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.12+-blue?style=for-the-badge&logo=python" alt="Python"></a>
-</p>
+## Lineage
 
-A modern, AI-assisted fork of [DevilXD/TwitchDropsMiner](https://github.com/DevilXD/TwitchDropsMiner) — rebuilt for reliability, simplicity, and automation.  
-**Twitch Drops Miner** lets you automatically farm Twitch drops without ever opening a stream.  
-No more tab juggling, channel switching, or missing rewards — just set it, forget it, and collect.
+- Original project by [DevilXD](https://github.com/DevilXD/TwitchDropsMiner) (desktop GUI).
+- Headless web fork by [rangermix](https://github.com/rangermix/TwitchDropsMiner) (v1.2.4 base).
+- Feature fork by [SimpliAj](https://github.com/SimpliAj/twitchdropsminer) (v1.3.15), merged into this fork on 2026-07-16: multi-account, parallel instances, predictions, Discord integration, and a reworked web UI.
+- This fork ([amdschuurman/TwitchDropsMiner](https://github.com/amdschuurman/TwitchDropsMiner)) adds security and reliability hardening on top.
 
----
+## Features
 
-## ✨ Features
+From the SimpliAj merge:
 
-- 🚀 **Streamless Mining** — Earn drops without streaming video by sending Twitch GraphQL watch events
-- 🔍 **Automatic Campaign Discovery** — Detects new drop events automatically
-- ⚙️ **Auto Channel Switching** — Always mines the best available stream
-- 💾 **Persistent Login** — OAuth login saved via cookies
-- 🕹️ **Simple Web UI** — Manage everything from your browser
-- 🛡️ **Safe Frontend Rendering** — Dynamic UI content is rendered with DOM APIs to avoid HTML injection
-- 🧩 **Docker-Ready** — One command to deploy anywhere
+- Multi-account support: each Twitch account lives in its own isolated `data/accounts/<name>/` directory (cookies, settings, drop history, channel points); switch accounts from the System tab or via the `/api/accounts` REST API.
+- Parallel instances: run several fully isolated miner processes at once, configured with `TDM_PORT` and `TDM_DATA_DIR`; add or remove instances from the System tab.
+- Channel points auto-claimer (WebSocket plus 60s GQL polling fallback) and idle watch on followed or configured channels when no campaigns are active.
+- Predictions auto-betting.
+- Discord webhooks (drop claimed, channel points chest) and a dedicated Discord bot with slash commands, live dashboard embed, and multi-server notifications (`discord_bot/`).
+- Campaign alerts, push notifications, stats and drop history APIs.
+- Reworked dark web UI with Main, Inventory, Channel Points, History, Analytics, Settings, System and Help tabs, campaign drops modal, drop name blacklist, mobile-responsive layout.
+- Immediate drop claiming, Spade watch-event fix, corrupt-cache JSON recovery.
 
----
+From this fork:
 
-## 🧰 Quick Start (Docker Recommended)
+- Bearer-token auth gate: a token in `data/api_token` (mode 0600) gates state-changing endpoints and the Socket.IO handshake; browsers get an httpOnly cookie via a one-time bootstrap URL printed at startup. Loopback clients bootstrap automatically.
+- Optional `WEB_PASSWORD` dashboard login (from SimpliAj) works alongside this.
+- CORS locked to same-origin by default; extendable with `TDM_TRUSTED_ORIGINS`.
+- Proxy URL validation and a non-root Docker container (UID 1000) with an entrypoint that fixes volume ownership on upgrade.
+- Reliability hardening: the main loop recovers from miner, request, GQL and websocket errors with exponential backoff; watch loops have timeouts; online checks tolerate per-batch GQL failures.
+- CI publishes multi-arch images to `ghcr.io/amdschuurman/twitchdropsminer`.
 
-### 🐳 Using Pre-Built Image (Docker run)
+## Quick start
 
-```bash
-docker pull rangermix/twitch-drops-miner:latest
-docker run -d -p 8080:8080 -v $(pwd)/data:/app/data rangermix/twitch-drops-miner:latest
-```
-
-### 📦 Using Docker Compose
+Docker Compose:
 
 ```yaml
 services:
   twitch-drops-miner:
-    image: rangermix/twitch-drops-miner:latest
+    image: ghcr.io/amdschuurman/twitchdropsminer:latest
     ports:
       - "8080:8080"
     volumes:
       - ./data:/app/data
-      # optional, use if you want to persist logs
       - ./logs:/app/logs
     environment:
-      # Set timezone (optional, defaults to UTC)
-      - TZ=Australia/Sydney
+      - TZ=Europe/Amsterdam
+      - WEB_PASSWORD=yourpassword   # optional dashboard password
     restart: unless-stopped
 ```
 
-### 🧑‍💻 From Source (for Developers)
-
 ```bash
-uv sync
-uv run main.py
+docker compose up -d
 ```
 
-Visit 👉 **<http://localhost:8080>**
+From source:
 
----
+```bash
+pip install -e .
+python main.py
+```
 
-## 🌈 Using the Web App
+Open `http://localhost:8080`, log in with the Twitch OAuth device flow, pick
+the games to farm under Settings, and the miner runs on its own. If you open
+the dashboard from another machine, use the bootstrap URL printed at startup
+(the line `Bootstrap URL: http://.../?token=...`) once; after that a cookie
+handles auth.
 
-1. Open `http://localhost:8080`
-2. Login with your Twitch account (OAuth device flow)
-3. The miner auto-fetches available campaigns
-4. Select games you want to farm, or type a custom game and click **Add Game** → click **Reload**
-5. TDM starts mining drops automatically 🎉
+Link your Twitch account to your game accounts at
+<https://www.twitch.tv/drops/campaigns> or drops will not credit.
 
-📝 **Tip:**  
-Make sure your Twitch account is linked to your game accounts →  
-👉 [https://www.twitch.tv/drops/campaigns](https://www.twitch.tv/drops/campaigns)
+## Multi-account parallel setup
 
----
+Each instance is an independent process with its own port and data directory.
+Instance 1 runs on port 8080 with `data/`; additional instances use ports
+8082, 8084, ... and `data2/`, `data3/`, ... Instances can also be managed from
+the System tab in the dashboard.
 
-## 🔐 Security & Auth
+Docker Compose, two accounts:
 
-This fork hardens the local web UI. Default behavior is single-user, on-host friendly:
+```yaml
+services:
+  tdm-account1:
+    image: ghcr.io/amdschuurman/twitchdropsminer:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - TZ=Europe/Amsterdam
+      - WEB_PASSWORD=yourpassword
+      - TDM_PORT=8080
+      - TDM_DATA_DIR=data
+    restart: unless-stopped
 
-| Scenario | What you need to do |
-|---|---|
-| Browser on the same machine as the miner (loopback) | Nothing — the session cookie is installed automatically on first page load. |
-| Browser on another LAN device, or accessing through `docker-compose up` from a remote host | Open the **bootstrap URL** printed on startup (look for the line `Bootstrap URL: http://…/?token=…`) once. The token is exchanged for an httpOnly cookie; subsequent visits are cookie-only. |
-| Docker on the LAN | Edit `docker-compose.yml` and replace `127.0.0.1:8080:8080` with `0.0.0.0:8080:8080`, then open the bootstrap URL from the remote browser. |
+  tdm-account2:
+    image: ghcr.io/amdschuurman/twitchdropsminer:latest
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./data2:/app/data
+      - ./logs2:/app/logs
+    environment:
+      - TZ=Europe/Amsterdam
+      - WEB_PASSWORD=yourpassword
+      - TDM_PORT=8082
+      - TDM_DATA_DIR=data
+    restart: unless-stopped
+```
 
-The token lives in `data/api_token` (mode `0600`). Delete the file to rotate it.
+From source with PM2:
 
-**Environment variables:**
+```bash
+TDM_PORT=8080 TDM_DATA_DIR=data   pm2 start main.py --name twitchdrops  --interpreter python3
+TDM_PORT=8082 TDM_DATA_DIR=data2  pm2 start main.py --name twitchdrops2 --interpreter python3
+pm2 save
+```
 
-- `TDM_HOST` — bind interface for uvicorn (default `127.0.0.1`; set to `0.0.0.0` for LAN)
-- `TDM_PORT` — bind port (default `8080`)
+Or plainly in two terminals:
 
-### 🔁 Upgrading from earlier versions / forks
+```bash
+TDM_PORT=8080 TDM_DATA_DIR=data   python main.py   # terminal 1
+TDM_PORT=8082 TDM_DATA_DIR=data2  python main.py   # terminal 2
+```
 
-`data/cookies.jar` (your Twitch session) and `data/settings.json` are preserved across upgrades; the new `data/api_token` is generated on first boot.
+Nginx reverse proxy serving two accounts from one domain:
 
-The Docker image now runs as a non-root user (UID 1000). If you previously ran the old image as root, the entrypoint will re-`chown` `./data` and `./logs` on the next container start — your cookies survive, no manual migration needed.
+```nginx
+server {
+    listen 443 ssl;
+    server_name tdm.example.xyz;
 
----
+    location / {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host $host;
+    }
 
-## ⚠️ Notes & Warnings
+    location /acc2/ {
+        proxy_pass         http://127.0.0.1:8082/;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host $host;
+    }
+}
+```
 
-> ⚠️ **Avoid Watching on the Same Account**  
-> Watching Twitch manually while the miner runs can cause progress desync.  
-> Use a different account if you want to watch live streams while mining.
+The dashboard shows account switcher buttons for every running instance;
+`?acc=2` in the URL jumps directly to instance 2. Running 3 or more instances
+from one IP may get flagged by Twitch; the dashboard warns about this.
 
-> 💡 **Requirements**  
-> Python 3.12+  
-> Docker optional but recommended  
-> Persistent data stored in `/data`
+## Environment variables
 
----
+| Variable | Default | Purpose |
+|---|---|---|
+| `TDM_HOST` | `127.0.0.1` | Bind interface for the web server; set `0.0.0.0` to allow LAN access. |
+| `TDM_PORT` | `8080` | Listening port; also selects the instance in parallel mode. |
+| `TDM_DATA_DIR` | `data` | Data directory for this instance (cookies, settings, history). |
+| `TDM_LABEL` | `Instance <port>` | Display name for this instance in the dashboard. |
+| `WEB_PASSWORD` | unset | Password-protects the dashboard (30-day session cookie). Unset means no password prompt. |
+| `TDM_AUTH_DISABLED` | unset | `true` disables the bearer-token auth gate. Only for deployments where a reverse proxy (Authelia, Cloudflare Access, an NPM access list) already enforces access control. |
+| `TDM_TRUSTED_ORIGINS` | unset | Comma-separated extra origins allowed by CORS and the Socket.IO handshake, e.g. `https://tdm.example.xyz`. Needed when serving the UI through a reverse proxy on another origin. |
+| `TDM_ALLOW_PRIVATE_WEBHOOKS` | unset | `true` allows Discord-webhook URLs that resolve to private/LAN addresses (self-hosted receivers). By default such URLs are rejected as an SSRF guard. |
+| `TZ` | UTC | Container timezone, used for timestamps in stats and alerts. |
 
-## 🖼️ Screenshot
+## Security notes
 
-![screenshot](./screenshot.png)
-> A clean, modern web UI lets you control everything from your browser.
+- The web server binds to loopback by default. For remote access, either bind
+  `0.0.0.0` and use the bootstrap URL and `WEB_PASSWORD`, or put the miner
+  behind an authenticating reverse proxy and set `TDM_AUTH_DISABLED=true`
+  plus `TDM_TRUSTED_ORIGINS`.
+- The API token lives in `data/api_token`; delete the file to rotate it.
+- The Docker image runs as UID 1000. On the first start after upgrading from
+  a root-based image, the entrypoint re-chowns `./data` and `./logs`;
+  `data/cookies.jar` (your Twitch session) survives the upgrade.
+- Discord bot secrets belong in `discord_bot/.env` (gitignored), never in the
+  repository.
 
----
+## Notes
 
-## 💖 Support the Project
+- Do not watch Twitch on the mining account in a regular browser at the same
+  time; it desyncs progress.
+- Requires Python 3.12 or newer when running from source. Persistent state is
+  stored in `data/`; back it up before updating.
+- Screenshots of the dashboard are in `docs/screenshots/`.
 
-If TwitchDropsMiner saves you time or bandwidth, please consider supporting continued development:
+## Acknowledgments
 
-<div align="center">
+- [DevilXD](https://github.com/DevilXD), creator of the original TwitchDropsMiner, and all its translation contributors.
+- [rangermix](https://github.com/rangermix) for the headless web rework.
+- [SimpliAj](https://github.com/SimpliAj) for multi-account, predictions, Discord integration, and the web UI rework merged into this fork.
 
-[![Buy Me a Coffee](https://i.imgur.com/cL95gzE.png)](https://buymeacoffee.com/rangermix)
-
-⭐ **Star this repo** → it really helps visibility!  
-💬 [Open an issue](../../issues) or [submit a PR](../../pulls) if you want to contribute.
-
-</div>
-
-You can also support the original author [@DevilXD](https://github.com/DevilXD):  
-👉 [buymeacoffee.com/DevilXD](https://www.buymeacoffee.com/DevilXD) or [Patreon](https://www.patreon.com/bePatron?u=26937862).
-
----
-
-## 🎯 Project Goals
-
-| Goal | Description |
-|------|--------------|
-| 🎯 **Focus** | Twitch Drops automation |
-| 🧩 **Ease of Use** | Simple web UI |
-| 🛡️ **Reliability** | Designed for continuous operation |
-| ⚙️ **Efficiency** | Minimal API calls, Twitch-friendly |
-| 🐳 **Deployment** | Docker-first, headless operation |
-
----
-
-## 🙏 Acknowledgments
-
-This project is a fork of the brilliant [TwitchDropsMiner](https://github.com/DevilXD/TwitchDropsMiner) by [@DevilXD](https://github.com/DevilXD).  
-Huge thanks to DevilXD and all contributors who built the foundation.
-
-For detailed translation and contribution credits, see [Acknowledgments](#original-project-credits) below.
-
----
-
-## 🧾 Disclaimer
-
-> ⚙️ This fork is heavily maintained and developed using AI-assisted coding (Claude Code).  
-> While stable, the codebase reflects “vibe coding” patterns — always review changes before deployment.  
-> Use responsibly.
-
----
-
-## 🧑‍💻 Original Project Credits
-
-<!---
-Note: The translations credits are sorted alphabetically, based on their English language name.
-When adding a new entry, please ensure to insert it in the correct place in the second section.
-Non-translations related credits should be added to the first section instead.
-
-Note: When adding a new credits line below, please add two trailing spaces at the end
-of the previous line, if they aren't already there. Doing so ensures proper markdown
-rendering on Github. In short: Each credits line should end with two trailing spaces,
-placed past the period character at the end.
-
-• Last line can have the two trailing spaces omitted.
-• Please ensure your editor won't trim the trailing spaces upon saving the file.
-• Please ensure to leave a single empty new line at the end of the file.
--->
-
-@guihkx - For the CI script, CI maintenance, and everything related to Linux builds.  
-@kWAYTV - For the implementation of the dark mode theme.  
-
-@Bamboozul - For the entirety of the Arabic (العربية) translation.  
-@Suz1e - For the entirety of the Chinese (简体中文) translation and revisions.  
-@wwj010 - For the Chinese (简体中文) translation corrections and revisions.  
-@zhangminghao1989 - For the Chinese (简体中文) translation corrections and revisions.  
-@Ricky103403 - For the entirety of the Traditional Chinese (繁體中文) translation.  
-@LusTerCsI - For the Traditional Chinese (繁體中文) translation corrections and revisions.  
-@nwvh - For the entirety of the Czech (Čeština) translation.  
-@Kjerne - For the entirety of the Danish (Dansk) translation.  
-@roobini-gamer - For the entirety of the French (Français) translation.  
-@Calvineries - For the French (Français) translation revisions.  
-@ThisIsCyreX - For the entirety of the German (Deutsch) translation.  
-@Eriza-Z - For the entirety of the Indonesian translation.  
-@casungo - For the entirety of the Italian (Italiano) translation.  
-@ShimadaNanaki - For the entirety of the Japanese (日本語) translation.  
-@Patriot99 - For the Polish (Polski) translation and revisions (co-authored with @DevilXD).  
-@zarigata - For the entirety of the Portuguese (Português) translation.  
-@Sergo1217 - For the entirety of the Russian (Русский) translation.  
-@kilroy98 - For the Russian (Русский) translation corrections and revisions.  
-@Shofuu - For the entirety of the Spanish (Español) translation and revisions.  
-@alikdb - For the entirety of the Turkish (Türkçe) translation.  
-@Nollasko - For the entirety of the Ukrainian (Українська) translation and revisions.  
-@kilroy98 - For the Ukrainian (Українська) translation corrections and revisions.  
+Use at your own risk; automated viewing may violate Twitch's terms of service.

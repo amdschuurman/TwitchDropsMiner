@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,8 @@ from typing import TYPE_CHECKING
 from dateutil.parser import isoparse
 
 from src.config.constants import MAX_EXTRA_MINUTES
+from src.services import drop_minutes_cache
+from src.services.drop_history import save_drop_claim
 from src.config.operations import GQL_OPERATIONS
 from src.exceptions import GQLException
 from src.i18n import _
@@ -64,6 +67,7 @@ class BaseDrop:
         ):
             self.is_claimed = True
         self.precondition_drops: list[str] = [d["id"] for d in (data["preconditionDrops"] or [])]
+        self.required_subs: int = data.get("requiredSubs", 0) or 0
 
     def __repr__(self) -> str:
         if self.is_claimed:
@@ -207,12 +211,23 @@ class TimedDrop(BaseDrop):
         self, campaign: DropsCampaign, data: JsonType, claimed_benefits: dict[str, datetime]
     ):
         super().__init__(campaign, data, claimed_benefits)
+        # "self" may be missing, null, or lack currentMinutesWatched - never crash the
+        # inventory parse over it; fall back to 0 API minutes instead.
         self_data: JsonType = data.get("self") or {}
-        self.real_current_minutes: int = self_data.get("currentMinutesWatched") or 0
+        api_minutes: int = self_data.get("currentMinutesWatched") or 0
         self.required_minutes: int = data["requiredMinutesWatched"]
+        self.real_current_minutes: int = drop_minutes_cache.get(self.id, api_minutes)
         self.extra_current_minutes: int = 0
         if self.is_claimed:
             # claimed drops may report inconsistent current minutes, so we need to overwrite them
+            self.real_current_minutes = self.required_minutes
+        elif (
+            not self.is_claimed
+            and self.real_current_minutes >= self.required_minutes > 0
+            and self._is_auto_granted()
+        ):
+            # badges/emotes are auto-granted by Twitch — no explicit claim needed
+            self.is_claimed = True
             self.real_current_minutes = self.required_minutes
 
     def __repr__(self) -> str:
@@ -285,6 +300,33 @@ class TimedDrop(BaseDrop):
     def _on_state_changed(self) -> None:
         self._twitch.gui.inv.update_drop(self)
 
+    def _is_auto_granted(self) -> bool:
+        return bool(self.benefits) and all(b.type.is_badge_or_emote() for b in self.benefits)
+
+    def _try_immediate_claim(self) -> None:
+        """
+        Claim as soon as we locally cross 100% progress, instead of waiting for the
+        next scheduled inventory fetch (up to an hour away) to notice via GAMES_UPDATE.
+        Without this, a drop that's actually done just sits there — still picked as
+        `first_drop`/blocking its precondition chain since `is_claimed` never flips —
+        while the watch loop keeps uselessly bumping it.
+        """
+        if self.is_claimed or self.claim_id is not None or self.progress < 1.0:
+            return
+
+        async def _do_claim() -> None:
+            await self.generate_claim()
+            claimed = await self.claim()
+            if claimed:
+                save_drop_claim(
+                    self.campaign.game.name,
+                    self.name,
+                    self.rewards_text(),
+                    self.benefits[0].image_url if self.benefits else None,
+                )
+
+        asyncio.create_task(_do_claim())
+
     def _update_real_minutes(self, delta: int) -> None:
         if delta == 0 or self.real_current_minutes + delta < 0 or not self.can_earn():
             return
@@ -292,13 +334,18 @@ class TimedDrop(BaseDrop):
             self.real_current_minutes += delta
         else:
             self.real_current_minutes = self.required_minutes
+            if self._is_auto_granted():
+                self.is_claimed = True
         self.extra_current_minutes = 0
+        drop_minutes_cache.update(self.id, self.real_current_minutes)
         self._on_state_changed()
+        self._try_immediate_claim()
 
     def _bump_minutes(self, channel: Channel | None) -> bool:
         if self.can_earn(channel):
             self.extra_current_minutes += 1
             self._on_state_changed()
+            self._try_immediate_claim()
             if self.extra_current_minutes >= MAX_EXTRA_MINUTES:
                 return True
         return False

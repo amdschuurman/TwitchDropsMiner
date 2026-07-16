@@ -66,6 +66,7 @@ class InventoryManager:
                     "benefits": benefits_data,
                     "starts_at": drop.starts_at.isoformat(),
                     "ends_at": drop.ends_at.isoformat(),
+                    "required_subs": drop.required_subs,
                 }
             )
 
@@ -79,6 +80,10 @@ class InventoryManager:
             "starts_at": campaign.starts_at.isoformat(),
             "ends_at": campaign.ends_at.isoformat(),
             "linked": campaign.linked,
+            "eligible": campaign.eligible,
+            "has_badge_or_emote": campaign.has_badge_or_emote,
+            "subscription_required": campaign.subscription_required,
+            "valid": campaign._valid,
             "active": campaign.active,
             "upcoming": campaign.upcoming,
             "expired": campaign.expired,

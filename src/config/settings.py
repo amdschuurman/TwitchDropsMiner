@@ -18,6 +18,7 @@ class InventoryFilters(TypedDict):
     show_finished: bool
     show_linked: bool
     show_not_linked: bool
+    show_sub_drops: bool
     show_upcoming: bool
 
 
@@ -35,6 +36,7 @@ default_settings = {
         "show_benefit_other": True,
         "show_expired": False,
         "show_finished": False,
+        "show_sub_drops": False,
         "show_linked": True,
         "show_not_linked": True,
         "show_upcoming": True,
@@ -47,6 +49,33 @@ default_settings = {
         "UNKNOWN": True,
     },
     "proxy": "",
+    "claim_channel_points": True,
+    "idle_channels": [],
+    "idle_parallel": True,
+    "idle_use_followed": False,
+    "preferred_games": [],
+    "scheduler_enabled": False,
+    "scheduler_start": "22:00",
+    "scheduler_stop": "08:00",
+    "discord_webhook_drops": "",
+    "discord_webhook_points": "",
+    "drop_name_blacklist": [],
+    "auto_prioritize": False,
+    "auto_add_linked": False,
+    "tab_counter_enabled": True,
+    "claim_moments": True,
+    "irc_chat_presence": True,
+    "discord_webhook_mentions": "",
+    "irc_mention_notify": True,
+    "make_predictions": False,
+    "bet_strategy": "SMART",
+    "bet_percentage": 5,
+    "bet_max_points": 50000,
+    "bet_minimum_points": 1000,
+    "bet_percentage_gap": 20,
+    "bet_delay_seconds": 30,
+    "prediction_channels": [],
+    "channel_strategies": {},
 }
 
 
@@ -60,6 +89,33 @@ class Settings:
     minimum_refresh_interval_minutes: int
     mining_benefits: dict[str, bool]
     proxy: str
+    claim_channel_points: bool
+    idle_channels: list[str]
+    idle_parallel: bool
+    idle_use_followed: bool
+    preferred_games: list[str]
+    scheduler_enabled: bool
+    scheduler_start: str
+    scheduler_stop: str
+    discord_webhook_drops: str
+    discord_webhook_points: str
+    drop_name_blacklist: list[str]
+    auto_prioritize: bool
+    auto_add_linked: bool
+    tab_counter_enabled: bool
+    claim_moments: bool
+    irc_chat_presence: bool
+    discord_webhook_mentions: str
+    irc_mention_notify: bool
+    make_predictions: bool
+    bet_strategy: str
+    bet_percentage: int
+    bet_max_points: int
+    bet_minimum_points: int
+    bet_percentage_gap: int
+    bet_delay_seconds: int
+    prediction_channels: list[str]
+    channel_strategies: dict[str, str]
 
     def __init__(self):
         self.load()

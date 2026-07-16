@@ -154,4 +154,33 @@ GQL_OPERATIONS: dict[str, GQLOperation] = {
             }
         },
     ),
+    "FollowedChannels": GQLOperation(
+        "ChannelFollows",
+        "eecf815273d3d949e5cf0085cc5084cd8a1b5b7b6f7990cf43cb0beadf546907",
+        variables={
+            "limit": 100,
+            "order": "DESC",
+        },
+    ),
+    "ClaimMoment": GQLOperation(
+        "CommunityMomentCallout_Claim",
+        "e2d67415aead910f7f9ceb45a77b750a1e1d9622c936d832328a0689e054db62",
+        variables={
+            "input": {
+                "momentID": ...,
+            },
+        },
+    ),
+    "MakePrediction": GQLOperation(
+        "MakePrediction",
+        "b44682ecc88358817009f20e69d75081b1e58825bb40aa53d5dbadcc17c881d8",
+        variables={
+            "input": {
+                "eventID": ...,
+                "outcomeID": ...,
+                "points": ...,
+                "transactionID": ...,
+            },
+        },
+    ),
 }

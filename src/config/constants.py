@@ -43,10 +43,11 @@ GQLRequest: TypeAlias = "GQLOperation | GQLQuery"
 MAX_INT = sys.maxsize
 MAX_EXTRA_MINUTES = 15
 BASE_TOPICS = 2
+EXTRA_TOPICS = 4  # CommunityPoints (1) + idle StreamState (1) + buffer (2)
 MAX_WEBSOCKETS = 8
 WS_TOPICS_LIMIT = 50
 TOPICS_PER_CHANNEL = 2
-MAX_TOPICS = (MAX_WEBSOCKETS * WS_TOPICS_LIMIT) - BASE_TOPICS
+MAX_TOPICS = (MAX_WEBSOCKETS * WS_TOPICS_LIMIT) - BASE_TOPICS - EXTRA_TOPICS
 MAX_CHANNELS = MAX_TOPICS // TOPICS_PER_CHANNEL
 
 # Misc
@@ -63,6 +64,7 @@ class State(Enum):
     """Application state machine states."""
 
     IDLE = auto()
+    PAUSED = auto()
     INVENTORY_FETCH = auto()
     GAMES_UPDATE = auto()
     CHANNELS_FETCH = auto()
@@ -167,5 +169,7 @@ WEBSOCKET_TOPICS: dict[str, dict[str, str]] = {
         "StreamState": "video-playback-by-id",
         "StreamUpdate": "broadcast-settings-update",
         "CommunityPoints": "community-points-channel-v1",  # unused
+        "Moments": "community-moments-channel-v1",
+        "Predictions": "predictions-channel-v1",
     },
 }

@@ -44,7 +44,7 @@ echo "" >> release_notes.md
 echo "### Docker Images" >> release_notes.md
 echo "" >> release_notes.md
 echo '```bash' >> release_notes.md
-echo "docker pull rangermix/twitch-drops-miner:$VERSION" >> release_notes.md
+echo "docker pull ghcr.io/${GITHUB_REPOSITORY_OWNER:-amdschuurman}/twitchdropsminer:$VERSION" >> release_notes.md
 echo '```' >> release_notes.md
 
 echo "✅ Release notes written to release_notes.md"

@@ -1,0 +1,24 @@
+# DISABLED — superseded by docker-release.yml (the canonical Docker publish
+# workflow for this fork, pushing ghcr.io/<owner>/twitchdropsminer via the
+# built-in GITHUB_TOKEN on pushes to main and release/** branches).
+#
+# This file came from the SimpliAj fork and hardcoded its registries
+# (ghcr.io/simpliaj + Docker Hub gitsimpliaj) with Docker Hub secrets that do
+# not exist in this repository; running both workflows on push-to-main would
+# double-publish and fail. Kept as a manual-only, no-op stub so the merge
+# history stays traceable. Safe to delete.
+
+name: Build & Push Docker Image (disabled)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  disabled:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain
+        run: echo "This workflow is disabled. Docker images are published by docker-release.yml."

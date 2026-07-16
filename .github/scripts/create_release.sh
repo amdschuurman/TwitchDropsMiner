@@ -34,6 +34,14 @@ echo "Current branch: $CURRENT_BRANCH"
 git config user.name "github-actions[bot]"
 git config user.email "github-actions[bot]@users.noreply.github.com"
 
+# Build authenticated push URL using GITHUB_TOKEN (workflow has contents:write permission)
+if [ -z "${GITHUB_TOKEN:-}" ] || [ -z "${GITHUB_REPOSITORY:-}" ]; then
+  echo "❌ GITHUB_TOKEN or GITHUB_REPOSITORY not set" >&2
+  exit 1
+fi
+echo "GITHUB_TOKEN length: ${#GITHUB_TOKEN}"
+PUSH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
 # Update version.py
 echo "Updating src/version.py..."
 echo "__version__ = \"$VERSION\"" > src/version.py
@@ -46,7 +54,7 @@ sed -i "s/^version = \"[^\"]*\"\(.*\)/version = \"$VERSION\"\1/" pyproject.toml
 echo "Committing version changes..."
 git add src/version.py pyproject.toml
 git commit -m "chore: bump version to $VERSION"
-git push origin "$CURRENT_BRANCH"
+git push "$PUSH_URL" "$CURRENT_BRANCH"
 
 NEW_BRANCH_NAME="release/$VERSION"
 
@@ -55,12 +63,12 @@ echo "Creating release branch: $NEW_BRANCH_NAME"
 git checkout -b "$NEW_BRANCH_NAME"
 
 # Push branch (this will trigger the publish workflow)
-git push origin "$NEW_BRANCH_NAME"
+git push "$PUSH_URL" "$NEW_BRANCH_NAME"
 
 # Create tag
 echo "Creating and pushing tag: v$VERSION"
 git tag "v$VERSION"
-git push origin "v$VERSION"
+git push "$PUSH_URL" "v$VERSION"
 
 # Success messages
 echo ""

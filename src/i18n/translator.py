@@ -61,6 +61,9 @@ class GUITabs(TypedDict):
     inventory: str
     settings: str
     help: str
+    system: str
+    stats: str
+    analytics: str
 
 
 class GUILoginForm(TypedDict):
@@ -190,6 +193,89 @@ class GUISettings(TypedDict):
     actions: str
     connection_quality: str
     minimum_refresh: str
+    select_linked: str
+    password_header: str
+    password_current_label: str
+    password_current_placeholder: str
+    password_new_label: str
+    password_new_placeholder: str
+    password_confirm_label: str
+    password_confirm_placeholder: str
+    password_save: str
+    password_disable: str
+    password_saved: str
+    password_disabled_msg: str
+    password_mismatch: str
+    password_status_active: str
+    password_status_inactive: str
+    discord_bot: dict
+    notifications_header: str
+    push_enabled: str
+    push_sound: str
+    campaign_end_alerts_enabled: str
+    # New i18n keys
+    channel_points_section: str
+    channel_points_auto_claim: str
+    channel_points_auto_claim_help: str
+    discord_notifications: str
+    discord_drops_webhook_label: str
+    discord_drops_webhook_help: str
+    discord_points_webhook_label: str
+    discord_points_webhook_help: str
+    test_webhook: str
+    proxy_url_label: str
+    set_proxy: str
+    verify_proxy: str
+    proxy_url_help: str
+    idle_watch: str
+    idle_watch_help: str
+    idle_auto_followed: str
+    idle_auto_followed_help: str
+    idle_channel_placeholder: str
+    idle_channel_add: str
+    blacklist: str
+    blacklist_help: str
+    scheduler: str
+    scheduler_help: str
+    scheduler_enable: str
+    scheduler_active_from: str
+    scheduler_active_until: str
+    scheduler_times_help: str
+    bot_notification_channels: str
+    bot_setchannel_hint: str
+    add_account: str
+    account_label_placeholder: str
+
+
+class GUISystem(TypedDict):
+    header: str
+    accounts_header: str
+    miner_header: str
+    miner_desc: str
+    reload_btn: str
+    restart_header: str
+    restart_desc: str
+    restart_btn: str
+    session_header: str
+    session_desc: str
+    logout_btn: str
+    reload_ok: str
+    restart_confirm: str
+    restart_ok: str
+
+
+class GUIAnalytics(TypedDict):
+    stats_header: str
+    total_claims: str
+    games_label: str
+    last_claim: str
+    claims_by_game: str
+    claims_activity: str
+    channel_points: str
+    refresh: str
+    no_channel_points: str
+    drop_history: str
+    no_history: str
 
 
 class GUIHelp(TypedDict):
@@ -229,6 +315,8 @@ class GUIMessages(TypedDict):
     footer: GUIFooter
     badges: GUIBadges
     wanted: GUIWanted
+    system: GUISystem
+    analytics: GUIAnalytics
 
 
 class Translation(TypedDict):
@@ -262,7 +350,15 @@ class Translator:
     def get_languages(self) -> list[str]:
         return list(self._langs.keys())
 
+    # Map of locale codes to language_name keys
+    _LOCALE_MAP: dict[str, str] = {
+        "en": "English", "de": "Deutsch", "es": "Español", "fr": "Français",
+        "pl": "Polski", "tr": "Türkçe", "uk": "Українська", "ar": "العربية",
+        "zh": "简体中文", "id": "Indonesian", "da": "Dansk", "cs": "Čeština",
+    }
+
     def set_language(self, language: str):
+        language = self._LOCALE_MAP.get(language, language)
         if language not in self._langs:
             raise ValueError(f"Unrecognized language {language}")
 

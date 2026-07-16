@@ -58,7 +58,10 @@ class WebGUIManager:
         # Callback to trigger game update when relevant settings change
         on_settings_change = self._twitch.get_change_state_callable(State.GAMES_UPDATE)
         self.settings = SettingsManager(
-            self._broadcaster, twitch.settings, self.output, on_change=on_settings_change
+            self._broadcaster, twitch.settings, self.output,
+            on_change=on_settings_change,
+            on_scheduler_change=twitch._scheduler_service.trigger_check,
+            on_predictions_enable=twitch._watch_service.subscribe_predictions_now,
         )
 
         # Selected channel tracking (set by web client)
@@ -145,6 +148,10 @@ class WebGUIManager:
             dark_mode: Whether to use dark theme
         """
         asyncio.create_task(self._broadcaster.emit("theme_change", {"dark_mode": dark_mode}))
+
+    def broadcast_pause_state(self, paused: bool):
+        """Broadcast pause state change to all connected clients."""
+        return self._broadcaster.emit("pause_state", {"paused": paused})
 
     def broadcast_manual_mode_change(self, manual_mode_info: dict):
         """Broadcast manual mode status change to connected clients.

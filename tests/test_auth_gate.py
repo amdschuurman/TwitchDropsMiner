@@ -310,7 +310,7 @@ class TestSafeAccountDir(AuthGateTestBase):
 
 
 class TestSessionTtl(AuthGateTestBase):
-    """Logins must not persist forever; TDM_SESSION_TTL controls the lifetime."""
+    """Login lifetime: permanent by default, tunable via TDM_SESSION_TTL."""
 
     def _bootstrap_cookie(self):
         # Loopback bootstrap installs the cookie with no token needed.
@@ -318,12 +318,18 @@ class TestSessionTtl(AuthGateTestBase):
         self.assertEqual(resp.status_code, 303)
         return resp.headers.get("set-cookie", "")
 
-    def test_default_is_a_session_cookie(self):
+    def test_default_is_permanent(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TDM_SESSION_TTL", None)
             cookie = self._bootstrap_cookie()
         self.assertIn(webapp.COOKIE_NAME, cookie)
-        # A session cookie carries neither Max-Age nor Expires.
+        # Permanent = a persistent cookie carrying the ~10-year Max-Age.
+        self.assertIn(f"Max-Age={webapp._PERMANENT_TTL}", cookie)
+
+    def test_session_mode_opt_in_is_a_session_cookie(self):
+        with patch.dict(os.environ, {"TDM_SESSION_TTL": "session"}):
+            cookie = self._bootstrap_cookie()
+        self.assertIn(webapp.COOKIE_NAME, cookie)
         self.assertNotIn("max-age", cookie.lower())
         self.assertNotIn("expires", cookie.lower())
 
@@ -332,15 +338,22 @@ class TestSessionTtl(AuthGateTestBase):
             cookie = self._bootstrap_cookie()
         self.assertIn("Max-Age=43200", cookie)
 
-    def test_server_side_password_session_expiry_is_capped(self):
-        # Even in session-cookie mode the stored password session self-expires.
+    def test_default_password_session_is_permanent(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TDM_SESSION_TTL", None)
             webapp._issue_password_session()
             stored = webapp._load_web_config()["sessions"][-1]
-        # expires is roughly now + 24h cap, never unbounded.
-        self.assertLessEqual(stored["expires"] - time.time(), webapp._SESSION_SERVER_CAP + 5)
-        self.assertGreater(stored["expires"] - time.time(), 0)
+        remaining = stored["expires"] - time.time()
+        # ~10 years out: permanent, not a short cap.
+        self.assertGreater(remaining, webapp._PERMANENT_TTL - 60)
+
+    def test_session_mode_password_session_is_capped(self):
+        with patch.dict(os.environ, {"TDM_SESSION_TTL": "session"}):
+            webapp._issue_password_session()
+            stored = webapp._load_web_config()["sessions"][-1]
+        remaining = stored["expires"] - time.time()
+        self.assertLessEqual(remaining, webapp._SESSION_SERVER_CAP + 5)
+        self.assertGreater(remaining, 0)
 
 
 class TestSocketIOAuthGate(AuthGateTestBase):

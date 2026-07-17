@@ -342,23 +342,29 @@ def _expected_token() -> str:
 _PW_SESSION_COOKIE = f"__tdm_session_{os.environ.get('TDM_PORT', '8080')}"
 _PW_SESSION_CAP = 20  # concurrent logins kept per instance
 
-# How long a login lasts. ``TDM_SESSION_TTL`` controls it:
-#   unset / "session" / "0"  -> a session cookie: the login is dropped when the
-#                               browser closes (does NOT stay logged in).
-#   "<n>" or "<n>h"          -> n hours;  "<n>d" -> n days (persists that long).
-# The default is a session cookie, so the login never persists indefinitely.
-_SESSION_SERVER_CAP = 60 * 60 * 24  # hard server-side lifetime cap for session mode
+# How long a login lasts. The default is PERMANENT — log in once and stay
+# logged in indefinitely. ``TDM_SESSION_TTL`` overrides it:
+#   unset / "permanent" / "never" / "forever" / "0"  -> permanent (default)
+#   "session"                                         -> drops on browser close
+#   "<n>" or "<n>h"  -> n hours;  "<n>d" -> n days    -> persists that long
+# (Browsers still cap persistent cookies at ~400 days; after that, open the
+#  bootstrap URL once more. The miner itself farms 24/7 regardless of login.)
+_SESSION_SERVER_CAP = 60 * 60 * 24  # server-side lifetime cap in "session" mode
+_PERMANENT_TTL = 60 * 60 * 24 * 3650  # ~10 years — effectively never expires
 
 
 def _session_ttl() -> tuple[int | None, int]:
     """Return ``(cookie_max_age, server_ttl_seconds)``.
 
-    ``cookie_max_age`` is ``None`` for a session cookie (expires on browser
-    close); ``server_ttl_seconds`` is always a concrete cap so stored password
-    sessions self-expire even in session-cookie mode.
+    ``cookie_max_age`` is ``None`` only for the opt-in "session" mode (expires
+    on browser close). By default it is ``_PERMANENT_TTL`` so a login persists
+    indefinitely. ``server_ttl_seconds`` matches, so stored password sessions
+    stay valid just as long.
     """
     raw = os.environ.get("TDM_SESSION_TTL", "").strip().lower()
-    if raw in ("", "session", "0"):
+    if raw in ("", "permanent", "never", "forever", "0"):
+        return _PERMANENT_TTL, _PERMANENT_TTL
+    if raw == "session":
         return None, _SESSION_SERVER_CAP
     try:
         if raw.endswith("d"):
@@ -368,7 +374,7 @@ def _session_ttl() -> tuple[int | None, int]:
         else:
             secs = int(raw) * 3600  # a bare number means hours
     except ValueError:
-        return None, _SESSION_SERVER_CAP
+        return _PERMANENT_TTL, _PERMANENT_TTL  # unparseable -> safe default (permanent)
     secs = max(60, secs)
     return secs, secs
 

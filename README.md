@@ -164,7 +164,8 @@ from one IP may get flagged by Twitch; the dashboard warns about this.
 | `TDM_PORT` | `8080` | Listening port; also selects the instance in parallel mode. |
 | `TDM_DATA_DIR` | `data` | Data directory for this instance (cookies, settings, history). |
 | `TDM_LABEL` | `Instance <port>` | Display name for this instance in the dashboard. |
-| `WEB_PASSWORD` | unset | Password-protects the dashboard (30-day session cookie). Unset means no password prompt. |
+| `WEB_PASSWORD` | unset | Password-protects the dashboard. Unset means no password prompt. |
+| `TDM_SESSION_TTL` | `session` | How long a login lasts. `session` (default) drops the login when the browser closes; `12h` / `7d` keeps it for that long. |
 | `TDM_AUTH_DISABLED` | unset | `true` disables the bearer-token auth gate. Only for deployments where a reverse proxy (Authelia, Cloudflare Access, an NPM access list) already enforces access control. |
 | `TDM_TRUSTED_ORIGINS` | unset | Comma-separated extra origins allowed by CORS and the Socket.IO handshake, e.g. `https://tdm.example.xyz`. Needed when serving the UI through a reverse proxy on another origin. |
 | `TDM_ALLOW_PRIVATE_WEBHOOKS` | unset | `true` allows Discord-webhook URLs that resolve to private/LAN addresses (self-hosted receivers). By default such URLs are rejected as an SSRF guard. |

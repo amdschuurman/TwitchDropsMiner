@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from src.auth.api_token import COOKIE_MAX_AGE, COOKIE_NAME, load_or_create_token
+from src.auth.api_token import COOKIE_NAME, load_or_create_token
 
 _DATA_DIR = Path(os.environ.get("TDM_DATA_DIR", str(Path(__file__).parent.parent.parent / "data")))
 _WEB_CONFIG_FILE = _DATA_DIR / "web_config.json"
@@ -340,8 +340,45 @@ def _expected_token() -> str:
 # The cookie name is suffixed with TDM_PORT so parallel instances behind one
 # domain (SimpliAj's /acc2/ nginx setup) don't clobber each other's sessions.
 _PW_SESSION_COOKIE = f"__tdm_session_{os.environ.get('TDM_PORT', '8080')}"
-_PW_SESSION_MAX_AGE = 60 * 60 * 24 * 30
 _PW_SESSION_CAP = 20  # concurrent logins kept per instance
+
+# How long a login lasts. ``TDM_SESSION_TTL`` controls it:
+#   unset / "session" / "0"  -> a session cookie: the login is dropped when the
+#                               browser closes (does NOT stay logged in).
+#   "<n>" or "<n>h"          -> n hours;  "<n>d" -> n days (persists that long).
+# The default is a session cookie, so the login never persists indefinitely.
+_SESSION_SERVER_CAP = 60 * 60 * 24  # hard server-side lifetime cap for session mode
+
+
+def _session_ttl() -> tuple[int | None, int]:
+    """Return ``(cookie_max_age, server_ttl_seconds)``.
+
+    ``cookie_max_age`` is ``None`` for a session cookie (expires on browser
+    close); ``server_ttl_seconds`` is always a concrete cap so stored password
+    sessions self-expire even in session-cookie mode.
+    """
+    raw = os.environ.get("TDM_SESSION_TTL", "").strip().lower()
+    if raw in ("", "session", "0"):
+        return None, _SESSION_SERVER_CAP
+    try:
+        if raw.endswith("d"):
+            secs = int(raw[:-1]) * 86400
+        elif raw.endswith("h"):
+            secs = int(raw[:-1]) * 3600
+        else:
+            secs = int(raw) * 3600  # a bare number means hours
+    except ValueError:
+        return None, _SESSION_SERVER_CAP
+    secs = max(60, secs)
+    return secs, secs
+
+
+def _cookie_max_age() -> int | None:
+    return _session_ttl()[0]
+
+
+def _server_session_ttl() -> int:
+    return _session_ttl()[1]
 
 
 def _issue_password_session() -> str:
@@ -351,7 +388,7 @@ def _issue_password_session() -> str:
     sessions = [s for s in cfg.get("sessions", []) if s.get("expires", 0) > now]
     sessions.append({
         "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
-        "expires": now + _PW_SESSION_MAX_AGE,
+        "expires": now + _server_session_ttl(),
     })
     cfg["sessions"] = sessions[-_PW_SESSION_CAP:]
     _save_web_config(cfg)
@@ -781,7 +818,7 @@ async def setup_post(request: Request):
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie(
             _PW_SESSION_COOKIE, _issue_password_session(),
-            httponly=True, samesite="lax", max_age=_PW_SESSION_MAX_AGE,
+            httponly=True, samesite="lax", max_age=_cookie_max_age(),
         )
         return resp
     else:
@@ -801,7 +838,7 @@ async def auth_login_post(request: Request):
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie(
             _PW_SESSION_COOKIE, _issue_password_session(),
-            httponly=True, samesite="lax", max_age=_PW_SESSION_MAX_AGE,
+            httponly=True, samesite="lax", max_age=_cookie_max_age(),
         )
         return resp
     return HTMLResponse(_render_template(_LOGIN_HTML, '<p class="err">Falsches Passwort</p>'), status_code=401)
@@ -836,7 +873,7 @@ async def session_bootstrap(request: Request, token: str | None = None):
         raise HTTPException(status_code=403, detail="Invalid or missing bootstrap token")
     response = RedirectResponse(url="/", status_code=303)
     response.set_cookie(
-        COOKIE_NAME, expected, max_age=COOKIE_MAX_AGE, httponly=True, samesite="lax"
+        COOKIE_NAME, expected, max_age=_cookie_max_age(), httponly=True, samesite="lax"
     )
     return response
 
@@ -889,7 +926,7 @@ async def serve_index(request: Request):
         response.set_cookie(
             COOKIE_NAME,
             _expected_token(),
-            max_age=COOKIE_MAX_AGE,
+            max_age=_cookie_max_age(),
             httponly=True,
             samesite="lax",
         )
@@ -1534,7 +1571,7 @@ async def change_password(data: PasswordChangeRequest, request: Request):
     if data.new_password:
         response.set_cookie(
             _PW_SESSION_COOKIE, _issue_password_session(),
-            httponly=True, samesite="lax", max_age=_PW_SESSION_MAX_AGE,
+            httponly=True, samesite="lax", max_age=_cookie_max_age(),
         )
     else:
         response.delete_cookie(_PW_SESSION_COOKIE)

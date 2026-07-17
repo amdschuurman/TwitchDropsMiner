@@ -31,8 +31,10 @@ which still exercises the full middleware chain exactly as a socket would.
 
 import asyncio
 import json
+import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -305,6 +307,40 @@ class TestSafeAccountDir(AuthGateTestBase):
         result = webapp._safe_account_dir("main")
         self.assertEqual(result.parent, accounts_root)
         self.assertEqual(result.name, "main")
+
+
+class TestSessionTtl(AuthGateTestBase):
+    """Logins must not persist forever; TDM_SESSION_TTL controls the lifetime."""
+
+    def _bootstrap_cookie(self):
+        # Loopback bootstrap installs the cookie with no token needed.
+        resp = self.request("/api/session/bootstrap", client_host="127.0.0.1")
+        self.assertEqual(resp.status_code, 303)
+        return resp.headers.get("set-cookie", "")
+
+    def test_default_is_a_session_cookie(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TDM_SESSION_TTL", None)
+            cookie = self._bootstrap_cookie()
+        self.assertIn(webapp.COOKIE_NAME, cookie)
+        # A session cookie carries neither Max-Age nor Expires.
+        self.assertNotIn("max-age", cookie.lower())
+        self.assertNotIn("expires", cookie.lower())
+
+    def test_explicit_ttl_sets_bounded_max_age(self):
+        with patch.dict(os.environ, {"TDM_SESSION_TTL": "12h"}):
+            cookie = self._bootstrap_cookie()
+        self.assertIn("Max-Age=43200", cookie)
+
+    def test_server_side_password_session_expiry_is_capped(self):
+        # Even in session-cookie mode the stored password session self-expires.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TDM_SESSION_TTL", None)
+            webapp._issue_password_session()
+            stored = webapp._load_web_config()["sessions"][-1]
+        # expires is roughly now + 24h cap, never unbounded.
+        self.assertLessEqual(stored["expires"] - time.time(), webapp._SESSION_SERVER_CAP + 5)
+        self.assertGreater(stored["expires"] - time.time(), 0)
 
 
 class TestSocketIOAuthGate(AuthGateTestBase):

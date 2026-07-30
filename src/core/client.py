@@ -38,6 +38,7 @@ from src.services.message_handlers import MessageHandlerService
 from src.services.prediction_service import PredictionService
 from src.services.scheduler_service import SchedulerService
 from src.services.stream_selector import StreamSelector
+from src.services.task_supervision import log_task_death
 from src.services.watch_service import WatchService
 from src.utils import (
     AwaitableValue,
@@ -86,6 +87,12 @@ class Twitch:
         self._watching_cp_topic_id: str = ""  # CommunityPoints topic for current watching channel
         self._watching_task: asyncio.Task[None] | None = None
         self._watching_restart = asyncio.Event()
+        # When Twitch last ACCEPTED a watch payload. The only progress signal the
+        # application has: every other health input describes configuration, which
+        # stays perfectly valid while a dead proxy, a rejected token or a stuck
+        # endpoint keeps the miner from earning a single minute. Written by
+        # WatchService.watch_loop, read by GET /api/health/mining.
+        self.last_watch_ok: datetime | None = None
         # Manual mode tracking
         self._manual_target_channel: Channel | None = None
         self._manual_target_game: Game | None = None
@@ -295,6 +302,11 @@ class Twitch:
         if self._scheduler_task is not None:
             self._scheduler_task.cancel()
         self._scheduler_task = asyncio.create_task(self._scheduler_service.run_scheduler())
+        # The scheduler is the only code that lifts a pause the scheduler placed,
+        # so its death is the one task exit that can leave the miner stopped while
+        # every setting and the health probe still look fine. It was the only
+        # long-lived task created without anything watching it.
+        self._scheduler_task.add_done_callback(log_task_death("Scheduler task"))
         # Add default topics
         self.websocket.add_topics(
             [

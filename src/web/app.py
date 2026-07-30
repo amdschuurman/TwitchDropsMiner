@@ -10,6 +10,7 @@ import secrets
 import time
 import urllib.parse
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -22,6 +23,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.auth.api_token import COOKIE_NAME, load_or_create_token
+from src.config import WATCH_INTERVAL
 
 _DATA_DIR = Path(os.environ.get("TDM_DATA_DIR", str(Path(__file__).parent.parent.parent / "data")))
 _WEB_CONFIG_FILE = _DATA_DIR / "web_config.json"
@@ -260,9 +262,10 @@ def _load_channel_points_history() -> dict:
 #
 # Public (never gated): the setup/login pages, favicon/logo/manifest, static
 # assets, /healthz (Docker liveness — must return 200 with no session),
-# /api/health/mining (uptime-monitor probe: booleans, counts, a coarse mining
-# state and the Twitch login only — no tokens, no channel or campaign names;
-# public by EXACT path, so a trailing slash on it is gated like anything else),
+# /api/health/mining (uptime-monitor probe: booleans, counts, elapsed seconds,
+# a coarse mining state and the Twitch login only — no tokens, no channel or
+# campaign names, and never the pending device code; public by EXACT path, so a
+# trailing slash on it is gated like anything else),
 # /api/pair/claim (the one-time pairing code IS the credential),
 # /api/session/bootstrap (validates its own token), the instance-switcher
 # registry reads (GET /api/instance + GET /api/instances), and the static
@@ -436,7 +439,8 @@ _PUBLIC_PATHS = {
     "/favicon.ico", "/logo.png", "/manifest.json",
     "/api/pair/claim",   # Discord bot pairing — the one-time code is the credential
     "/healthz",          # Docker/orchestrator liveness probe — must pass with no session
-    # Uptime-monitor probe — booleans/counts/coarse state, no secrets.
+    # Uptime-monitor probe — booleans/counts/elapsed seconds/coarse state, no
+    # secrets and never the pending device code.
     # EXACT-PATH entry, like every other member of this set: _is_public_request
     # compares with ``in``, never by prefix. So "/api/health/mining/" — the same
     # URL with a trailing slash — is NOT public and answers 401, which a monitor
@@ -737,11 +741,23 @@ class SettingsUpdate(BaseModel):
     claim_moments: bool | None = None
     irc_chat_presence: bool | None = None
     irc_mention_notify: bool | None = None
-    # Request-only intent flag, NOT a setting: it authorizes emptying
-    # ``games_to_watch`` for this one request (the UI's "clear all" gesture).
-    # SettingsManager.update_settings pops it off the payload before any
-    # per-key write, so it can never be stored on Settings or in settings.json.
+    # Request-only keys, NOT settings. SettingsManager._consume_mining_intents
+    # pops every one of them off the payload before any per-key write, so none
+    # can be stored on Settings or in settings.json.
+    #
+    # The two ``allow_empty_*`` flags authorize emptying a setting whose empty
+    # value stops all mining, for this one request (the UI's "clear all" and
+    # "disable every benefit type" gestures).
     allow_empty_games_to_watch: bool | None = None
+    allow_empty_mining_benefits: bool | None = None
+    # Optimistic concurrency for the one destructive case: a request that empties
+    # ``games_to_watch`` must also state the list it believed was stored, and is
+    # refused when that does not match. Without it a tab loaded while the list
+    # was ['A'] can click one ✕ and wipe ['A','B','C'], because "the user cleared
+    # everything" and "a stale client thinks everything is one game" are the same
+    # payload. Ignored when ``games_to_watch`` is non-empty, so normal saves are
+    # unaffected.
+    expected_games_to_watch: list[str] | None = None
 
 
 class ProxyVerifyRequest(BaseModel):
@@ -976,19 +992,42 @@ async def healthz():
 
 _ProbeField = TypeVar("_ProbeField")
 
+# When this process came up. The floor under every elapsed-seconds field the
+# probe publishes: ``Twitch.last_watch_ok`` is ``None`` until the first accepted
+# watch payload, and a fresh start legitimately spends its first minute logging
+# in and fetching inventory before it can watch anything at all. Measuring the
+# silence from here rather than from "never" gives a restart the same grace a
+# running miner gets between ticks, so a normal boot cannot be reported as a
+# stall — the false alarm that would teach an operator to ignore the alert.
+_PROCESS_START = datetime.now(timezone.utc)
+
+
+def _elapsed_seconds(since: datetime) -> int:
+    """Whole seconds from ``since`` until now, never negative.
+
+    Clamped at zero because a clock step backwards (NTP correcting a drifting
+    container host, or a host resuming from suspend) would otherwise publish a
+    negative age, and a watchdog comparing that against a threshold reads a
+    stalled miner as freshly alive.
+    """
+    return max(0, int((datetime.now(timezone.utc) - since).total_seconds()))
+
 
 class _MiningHealthProbe:
     """Builds the public ``/api/health/mining`` body without ever raising.
 
-    Two properties are structural rather than incidental, so they live in a
+    Four properties are structural rather than incidental, so they live in a
     class instead of one long endpoint body:
 
-    * **Nothing is disclosed beyond booleans, counts, a coarse state and the
-      Twitch login.** In particular the miner's own status line is NOT exposed:
-      it embeds the watched channel name and, in manual mode, the targeted game
-      (``src/core/client.py:741-744``, ``:349``) — exactly the campaign detail
-      this unauthenticated endpoint promises not to leak. ``state`` is derived
-      from the miner OBJECTS, never by matching that localized text.
+    * **Nothing is disclosed beyond booleans, counts, elapsed seconds, a coarse
+      state and the Twitch login.** In particular the miner's own status line is
+      NOT exposed: it embeds the watched channel name and, in manual mode, the
+      targeted game (``src/core/client.py:741-744``, ``:349``) — exactly the
+      campaign detail this unauthenticated endpoint promises not to leak.
+      ``state`` is derived from the miner OBJECTS, never by matching that
+      localized text. Neither is the pending OAuth device code: ``login_pending``
+      reports only THAT one is outstanding, never the code or its URL, which
+      would let an anonymous caller finish the operator's login for them.
     * **One failing read cannot corrupt the rest of the report.** Every field
       goes through :meth:`_read`, which isolates it in its own ``try``, so a
       raising attribute no longer zeroes its neighbours — and it marks the whole
@@ -998,6 +1037,13 @@ class _MiningHealthProbe:
       ``watching_channel`` is not proof of mining: idle-watching sets it too. So
       ``state`` asks the miner's state machine whether it is idle, and an
       idle-watching miner reports ``idle`` — see :meth:`_idle_watching`.
+    * **``ok`` measures PROGRESS, not just configuration.** Watch list, benefit
+      selection and wanted-game count all describe what the miner intends to do,
+      and every one of them stays perfectly valid while a miner that is logged
+      out, blocked on a device code, or talking to a dead endpoint mines nothing
+      for days. So ``ok`` also folds in the two signals that only a running
+      miner can produce: an actual Twitch login (:meth:`_login_status`) and a
+      recently ACCEPTED watch payload (:meth:`_last_watch_age`, :meth:`_stalled`).
     """
 
     # The complete coarse-state vocabulary. An external watchdog matches on
@@ -1006,6 +1052,10 @@ class _MiningHealthProbe:
     IDLE = "idle"  # up, but not mining: nothing minable, or only idle-watching
     WATCHING = "watching"  # actively watching a channel FOR DROPS
     PAUSED = "paused"  # deliberately paused by the operator
+
+    # How many missed watch payloads make a stall. Sized in :meth:`_stalled`.
+    STALL_TICKS = 10
+    STALL_AFTER_SECONDS = WATCH_INTERVAL.total_seconds() * STALL_TICKS
 
     def __init__(self, twitch: Twitch | None, gui: WebGUIManager | None) -> None:
         self._twitch = twitch
@@ -1023,6 +1073,18 @@ class _MiningHealthProbe:
     def _games_to_watch(self) -> list[str]:
         # None mid-boot is normal, not an error.
         return list(getattr(self._twitch.settings, "games_to_watch", None) or [])  # type: ignore[union-attr]
+
+    def _mining_benefits(self) -> dict[str, bool]:
+        """The benefit types currently worth mining.
+
+        The un-floored twin of the watch list, and the reason this probe reports
+        it: ``Benefit.is_wanted`` is fail-CLOSED, so a selection with nothing
+        enabled makes every drop unwanted, ``wanted_games`` empty and mining
+        stops completely - with a full, healthy-looking watch list next to it.
+        Reporting only ``watchlist_empty`` left that state answering ``ok: true``
+        to the monitor installed to catch exactly this shape of outage.
+        """
+        return dict(getattr(self._twitch.settings, "mining_benefits", None) or {})  # type: ignore[union-attr]
 
     def _wanted_games_count(self) -> int:
         return len(self._twitch.wanted_games)  # type: ignore[union-attr]
@@ -1074,28 +1136,159 @@ class _MiningHealthProbe:
         # miner's state machine is out of its idle branch - see _idle_watching.
         return self.IDLE if self._idle_watching() else self.WATCHING
 
-    def _login(self) -> str | None:
-        return self._gui.login.get_status().get("user_login")  # type: ignore[union-attr]
+    def _login_status(self) -> dict[str, Any]:
+        """The login manager's status dict — read once, two fields derived.
+
+        ``LoginFormManager.get_status`` (``src/web/managers/login.py:98-109``) is
+        the only place that knows a device-code login is in flight: it adds an
+        ``oauth_pending`` entry for the whole time ``ask_enter_code`` is blocked
+        on a human. That block sits UNDER ``Twitch._run``'s ``await
+        self.get_auth()``, so the watch task does not exist yet and every other
+        input this probe has still describes a healthy-looking configuration.
+
+        Only the PRESENCE of ``oauth_pending`` is used. Its payload is the
+        activation URL and the device code itself, which an unauthenticated
+        caller must never be handed — see the no-disclosure rule above.
+
+        The sibling ``status`` text is deliberately ignored: it is localized
+        (``lang/*.json``), so matching on it would break on a language change.
+        """
+        return dict(self._gui.login.get_status())  # type: ignore[union-attr]
+
+    def _last_watch_age(self) -> int | None:
+        """Seconds since Twitch last ACCEPTED a watch payload; None if never.
+
+        ``Twitch.last_watch_ok`` (``src/core/client.py:95``, stamped in
+        ``src/services/watch_service.py:282``) is the application's only proof
+        that it is still making contact. Everything else this probe reads is
+        configuration, which survives a dead proxy, an expired token and a stuck
+        endpoint completely unchanged.
+        """
+        stamp: datetime | None = self._twitch.last_watch_ok  # type: ignore[union-attr]
+        if stamp is None:
+            return None
+        return _elapsed_seconds(stamp)
+
+    def _uptime(self) -> int:
+        """Seconds since this process started.
+
+        Published so a watchdog can separate the two states that otherwise look
+        identical from outside: a miner that has been logged out for an hour, and
+        one that came up eight seconds ago and has not finished logging in yet.
+        """
+        return _elapsed_seconds(_PROCESS_START)
+
+    def _stalled(
+        self,
+        wanted_games_count: int,
+        state: str,
+        last_watch_age: int | None,
+        uptime: int,
+    ) -> bool:
+        """Whether the miner wants to be mining and demonstrably is not.
+
+        Pure arithmetic over values already read, so it cannot raise and cannot
+        turn this endpoint into a 5xx.
+
+        ``last_watch_ok`` on its own answers nothing. It is stamped by the IDLE
+        watch as well as by real mining — ``watch_loop`` is the same loop for
+        both (``src/services/watch_service.py:282``) — so a fresh stamp is not
+        proof of mining. And a missing stamp is not proof of failure either,
+        because a miner with nothing to mine is SUPPOSED to be quiet. Only the
+        pair carries information: the miner says it wants something
+        (``wanted_games_count``), and nothing has been accepted for far longer
+        than the cadence at which acceptance normally happens.
+
+        ``wanted_games_count == 0`` therefore never triggers this on its own. It
+        means "no active campaign for my games right now", which is the normal
+        state a healthy single-game account sits in for days at a time; an alert
+        that fires there trains its owner to ignore it, which is strictly worse
+        than the gap it closes.
+
+        Window sizing: ``STALL_TICKS`` (10) is ten missed payloads, ~9m50s at the
+        current 59s ``WATCH_INTERVAL``. It is sized off the longest gap a HEALTHY
+        miner produces, not off the interval itself. When a watched stream ends
+        the miner stops watching and has to pick a replacement, and a candidate
+        only becomes eligible after ``ONLINE_DELAY`` (120s) of being live, so
+        several quiet minutes across a bad run of channel switches is routine —
+        which puts a five-minute window right on top of normal behaviour. Ten
+        ticks clears that with room to spare while still surfacing a real stall
+        inside a single alert cycle.
+        """
+        if wanted_games_count <= 0 or state == self.PAUSED:
+            return False
+        # And only when the miner believes it IS watching. A wanted game with no
+        # live channel carrying it right now leaves state at `idle` with nothing
+        # stamped, for up to an hour at a time (the bottom-of-loop wait), and
+        # that is ordinary: campaigns run around the clock, streamers do not.
+        # Alerting there would fire on the same "healthy but quiet" shape the
+        # paragraph above refuses to fire on, just one step further along. What
+        # is left is unambiguous: the miner says it is watching a channel and no
+        # payload has been accepted for ten ticks, which is a real stall.
+        if state != self.WATCHING:
+            return False
+        # A process cannot have been silent for longer than it has been running.
+        # The uptime floor is what gives a restart its grace period, and what
+        # stops a stamp left over from before a clock step reading as ancient.
+        silent_for = uptime if last_watch_age is None else min(last_watch_age, uptime)
+        return silent_for > self.STALL_AFTER_SECONDS
 
     def body(self) -> dict[str, Any]:
         games_to_watch: list[str] = self._read(self._games_to_watch, [])
+        mining_benefits: dict[str, bool] = self._read(self._mining_benefits, {})
         wanted_games_count = self._read(self._wanted_games_count, 0)
         state = self._read(self._state, self.STARTING)
-        login = self._read(self._login, None)
+        login_status: dict[str, Any] = self._read(self._login_status, {})
+        last_watch_age = self._read(self._last_watch_age, None)
+        uptime = self._read(self._uptime, 0)
         watchlist_empty = not games_to_watch
+        benefits_disabled = not any(mining_benefits.values())
+        # An empty string is not a login. /oauth2/validate is read with
+        # .get("login", "") (src/auth/auth_state.py:285), so "" means "logged in
+        # but unnamed" - which is nothing a monitor can act on, and the
+        # documented value for "no login" is null.
+        login = login_status.get("user_login") or None
+        login_pending = bool(login_status.get("oauth_pending"))
+        watch_stalled = self._stalled(wanted_games_count, state, last_watch_age, uptime)
         return {
-            # Keyword an external monitor matches on: false whenever the watch
-            # list is empty (nothing to mine), the miner is not up yet, or a
-            # state read failed and the rest of this body is only half-true.
-            "ok": not self._degraded and not watchlist_empty,
+            # Keyword an external monitor matches on: false whenever there is
+            # nothing to mine (the watch list is empty, or no benefit type is
+            # enabled so no drop counts as wanted), nothing CAN be mined (no
+            # Twitch login, or a device-code login blocked on a human), nothing
+            # IS being mined although the miner wants to (watch_stalled), the
+            # miner is not up yet, or a state read failed and the rest of this
+            # body is only half-true.
+            "ok": (
+                not self._degraded
+                and not watchlist_empty
+                and not benefits_disabled
+                and login is not None
+                and not login_pending
+                and not watch_stalled
+            ),
             "watchlist_empty": watchlist_empty,
+            # Reported separately from watchlist_empty because the fix differs:
+            # one needs games added, the other needs a benefit type re-enabled.
+            "benefits_disabled": benefits_disabled,
             "games_to_watch_count": len(games_to_watch),
             "wanted_games_count": wanted_games_count,
             "state": state,
             # Redundant with state == WATCHING, kept because monitors already
             # alert on it.
             "mining": state == self.WATCHING,
+            # The progress fields. watch_stalled is the verdict to alert on;
+            # last_watch_age_seconds is the measurement behind it (null = not one
+            # accepted watch payload since this process started), and
+            # uptime_seconds is what tells a boot apart from a standstill.
+            "watch_stalled": watch_stalled,
+            "last_watch_age_seconds": last_watch_age,
+            "uptime_seconds": uptime,
             "login": login,
+            # True only while a device-code login is waiting for someone to type
+            # the code into twitch.tv/activate. Nothing gets mined until they do,
+            # and no amount of restarting fixes it - it needs a human. The code
+            # itself is never disclosed here.
+            "login_pending": login_pending,
         }
 
 
@@ -1104,17 +1297,26 @@ async def health_mining():
     """Unauthenticated readiness probe an uptime monitor can keyword-match on.
 
     Liveness (``/healthz``) only proves the web server answers; this reports
-    whether the miner has anything to mine at all. An empty ``games_to_watch``
+    whether the miner is actually mining. An empty ``games_to_watch``
     is the silent-failure state that once cost five days of mining, so it
-    flips ``ok`` to false and gives a monitor something to alert on.
+    flips ``ok`` to false and gives a monitor something to alert on. So does a
+    ``mining_benefits`` selection with every type disabled, which reaches the
+    same standstill by the other road and used to answer ``ok: true``.
+
+    Those two are configuration, though, and configuration stays valid while
+    nothing is mined. Two live signals are folded in for that: there must be a
+    Twitch ``login`` and no ``login_pending`` device code blocked on a human,
+    and the miner must not be ``watch_stalled`` - wanting games, not paused, and
+    yet with no watch payload accepted for ten watch intervals.
 
     Always answers HTTP 200 — never 5xx — so the Docker HEALTHCHECK and the
     container restart policy are unaffected no matter what this reports, and
     degrades to ``ok: false`` while the miner is still starting up.
 
     Public (see ``_PUBLIC_PATHS``): a monitor has no session token, so the body
-    is deliberately limited to booleans, counts, a coarse ``state`` and the
-    Twitch login. No tokens, no cookies, no channel or campaign names — see
+    is deliberately limited to booleans, counts, two elapsed-second counters, a
+    coarse ``state`` and the Twitch login. No tokens, no cookies, no channel or
+    campaign names, and never the device code — see
     ``_MiningHealthProbe`` for how that is kept true.
     """
     return _MiningHealthProbe(twitch_client, gui_manager).body()

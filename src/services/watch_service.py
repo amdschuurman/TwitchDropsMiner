@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from datetime import datetime, timezone
 from time import time
 from typing import TYPE_CHECKING, NoReturn
 
@@ -273,6 +274,12 @@ class WatchService:
             if not succeeded:
                 logger.log(CALL, f"Watch requested failed for channel: {channel.name}")
             else:
+                # The application's only proof that it is still making contact.
+                # Recorded here rather than derived from the log line below,
+                # because a health probe cannot read a log line - and every other
+                # input it has describes configuration, which survives a dead
+                # proxy, an expired token and a stuck endpoint unchanged.
+                self._twitch.last_watch_ok = datetime.now(timezone.utc)
                 logger.info(f"Watch sent OK: {channel.name} (broadcast_id={channel._stream.broadcast_id if channel._stream else 'none'})")
 
             # Multi-channel idle: also send watch to all other idle channels

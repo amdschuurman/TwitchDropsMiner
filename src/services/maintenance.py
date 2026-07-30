@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("TwitchDrops")
 
+# The shortest reload period this loop can honour. Not a validator: the stored
+# setting is never rewritten, only the period this task sleeps for.
+_MINIMUM_REFRESH_MINUTES: int = 1
+
 
 class MaintenanceService:
     """
@@ -42,6 +46,35 @@ class MaintenanceService:
         """
         self._twitch = twitch
 
+    def _refresh_period(self) -> timedelta:
+        """How long until this task asks for the next inventory reload.
+
+        Floored, because ``minimum_refresh_interval_minutes`` has no bound
+        anywhere: the settings model types it as a plain int, the UI box's
+        ``min="1"`` is not read back by the client, and ``merge_json`` only
+        checks that a stored value is an int. At zero or below, ``next_period``
+        is already in the past when this task starts, so it breaks out of the
+        loop immediately, asks for an INVENTORY_FETCH, and is restarted by
+        ``fetch_inventory`` - a hot loop that refetches the entire inventory as
+        fast as Twitch will answer and never lets the state machine reach
+        CHANNEL_SWITCH. Mining stops, and every setting still reads as valid.
+
+        The floor is applied HERE rather than as a validator on the way in, so
+        that it cannot fight anyone: the operator's stored value is left exactly
+        as they typed it, and the only thing refused is a period this loop is
+        physically unable to honour.
+        """
+        configured: int = self._twitch.settings.minimum_refresh_interval_minutes
+        if configured < _MINIMUM_REFRESH_MINUTES:
+            logger.warning(
+                f"minimum_refresh_interval_minutes is {configured}, which would make this "
+                f"task refetch the inventory in a loop and never leave it time to mine. "
+                f"Using {_MINIMUM_REFRESH_MINUTES} minute(s) instead - set a real value in "
+                f"the settings to silence this"
+            )
+            configured = _MINIMUM_REFRESH_MINUTES
+        return timedelta(minutes=configured)
+
     @task_wrapper(critical=True)
     async def run_maintenance_task(self) -> None:
         """
@@ -57,9 +90,7 @@ class MaintenanceService:
         3. After reaching the next hour boundary, request inventory reload
         """
         now = datetime.now(timezone.utc)
-        next_period = now + timedelta(
-            minutes=self._twitch.settings.minimum_refresh_interval_minutes
-        )
+        next_period = now + self._refresh_period()
 
         while True:
             # exit if there's no need to repeat the loop

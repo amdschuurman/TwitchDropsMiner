@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, TypedDict, cast
+from datetime import time
+from typing import Any, ClassVar, TypedDict, cast
 
 from src.config import DEFAULT_LANG, LANG_PATH, SETTINGS_PATH, JsonType
 from src.utils import json_load, json_save
@@ -10,14 +11,15 @@ from src.utils import json_load, json_save
 
 logger = logging.getLogger("TwitchDrops")
 
-# The one setting whose empty value silently disables the whole application, so
-# the one that gets a floor on the write side (see Settings.save).
+# The settings whose empty value silently disables the whole application, so the
+# ones that get a floor on the write side (see Settings.save and MiningFloor).
 _WATCHLIST_KEY = "games_to_watch"
+_BENEFITS_KEY = "mining_benefits"
 
-# Handed to json_load as the stored watch list's default value, so that "the file
-# could not be read" is distinguishable from "the file says the list is empty":
+# Handed to json_load as a guarded key's default value, so that "the file could
+# not be read" is distinguishable from "the file says this key is empty":
 # json_load returns the defaults it was given on an unparseable file, and no value
-# decoded from JSON can ever BE this object (see Settings._stored_games_to_watch).
+# decoded from JSON can ever BE this object (see Settings._stored_value).
 _UNREADABLE = object()
 
 
@@ -95,6 +97,13 @@ default_settings = {
     "prediction_channels": [],
     "channel_strategies": {},
 }
+
+# The benefit types a ``mining_benefits`` selection may name, taken from the
+# defaults so there is exactly one list of them in the codebase. They are the
+# ``BenefitType`` member names (src/models/benefit.py), which is what
+# ``Benefit.is_wanted`` looks itself up by; ``merge_json`` already enforces this
+# exact key set on every load, so a key outside it is not a setting at all.
+MINING_BENEFIT_KEYS: frozenset[str] = frozenset(cast(JsonType, default_settings[_BENEFITS_KEY]))
 
 
 class LanguageNormalizer:
@@ -235,6 +244,266 @@ class LanguageNormalizer:
         return _.current_language
 
 
+class ClockTime:
+    """A ``HH:MM`` scheduler boundary, checked where it is written.
+
+    The third way a settings write silently stops all mining, and the loudest
+    one to reproduce: ``SchedulerService._parse_time`` does
+    ``time(int(parts[0]), int(parts[1]))`` with no guard, and nothing catches
+    what that raises. ``"banana"`` and ``""`` raise ValueError from ``int``,
+    ``"22"`` raises IndexError, ``"24:00"`` and ``"-1:00"`` raise ValueError
+    from ``time`` - and each of them takes the exception straight out of
+    ``run_scheduler``'s loop, which kills the task for the rest of the process
+    (``src/services/scheduler_service.py:20-55``, started once at
+    ``src/core/client.py:297``). If the scheduler had already paused the miner,
+    nothing is left to resume it: mining stops until somebody restarts the
+    container, with no console line and a health probe that still says ``ok``,
+    because a paused miner is a legitimate state.
+
+    Every one of those five values is reachable through ``POST /api/settings``
+    today - the payload model types these as plain strings - and through a hand
+    edit of settings.json, which ``merge_json`` waves through because ``str`` is
+    the right TYPE. So the check goes where the language check went: at the
+    write boundary, before the value is stored, and again at load, because the
+    equality short-circuit in ``check_and_update_setting`` means an already
+    poisoned stored value is never re-validated by the UI posting it back.
+
+    Deliberately at least as strict as the parser it guards: it demands exactly
+    two ``:``-separated fields, where that parser would also accept
+    ``"22:00:30"``. Anything this accepts, the scheduler can parse.
+    """
+
+    @staticmethod
+    def parse(value: Any) -> time:
+        """The time this string names, or ValueError - never anything else."""
+        if not isinstance(value, str):
+            raise ValueError(f"Not a time of day: {value!r}")
+        parts = value.strip().split(":")
+        if len(parts) != 2:
+            raise ValueError(f"Expected a HH:MM time of day, found {value!r}")
+        try:
+            hour, minute = (int(part) for part in parts)
+        except ValueError:
+            raise ValueError(f"Expected a HH:MM time of day, found {value!r}") from None
+        return time(hour, minute)
+
+    @classmethod
+    def accepts(cls, value: Any) -> bool:
+        """True when the scheduler can parse this without raising."""
+        try:
+            cls.parse(value)
+        except ValueError:
+            return False
+        return True
+
+    @classmethod
+    def repair(cls, value: Any, key: str) -> str:
+        """Return a parseable time, falling back to the default out loud.
+
+        Unlike :meth:`LanguageNormalizer.repair` there is no "valid but
+        temporarily unusable" case to protect: a string either names a time of
+        day or it does not, so replacing one that does not costs the operator
+        nothing that was still recoverable.
+
+        Deliberately does NOT also switch ``scheduler_enabled`` off. Turning the
+        scheduler off would mutate a setting the operator really did choose, on
+        evidence about a different one, and the next save would persist that
+        loss. A repaired boundary is visible in the Settings tab and fixable
+        there; the ERROR line names the key and the value it discarded.
+        """
+        if cls.accepts(value):
+            return cast(str, value)
+        default = cast(str, default_settings[key])
+        logger.error(
+            f"Unusable {key} {value!r} in settings: the scheduler cannot read it, and the "
+            f"error it raises kills the scheduler task, which can leave mining paused with "
+            f"nothing left to resume it. Falling back to {default}."
+        )
+        return default
+
+
+class MiningFloor:
+    """One "emptying this setting silently stops the miner" rule.
+
+    There is more than one setting whose empty value means "mine nothing", and
+    they all fail in the same shape: no exception, no refusal, one bland
+    ``Setting changed`` line, a health probe that still says ``ok``, and a miner
+    that quietly does nothing until somebody notices days later. So the rule is
+    written once here and instantiated per guarded key, rather than copied:
+
+    * ``games_to_watch`` - the list of games to mine. Empty means no game is
+      ever selected. This is the one that cost five days in production.
+    * ``mining_benefits`` - which benefit types are worth mining.
+      ``Benefit.is_wanted`` is fail-CLOSED (``allowed_benefits.get(name,
+      False)``), so a selection that enables nothing makes every drop unwanted,
+      ``wanted_games`` empty, and mining stops just as completely as an empty
+      watch list does - with a watch list that still looks perfectly healthy.
+
+    The invariant is on the STORED value, never on the incoming payload: the
+    case that actually hurts is the value becoming empty in memory with no
+    request behind it (a corrupt load, a rogue mutation, a future cleaner) and
+    then being cemented by an unrelated save such as a dark-mode toggle. See
+    :meth:`Settings.save`.
+
+    Subclasses are used as classes, not instances: there is exactly one of each
+    and they hold no state, so ``Settings._FLOORS`` is a tuple of the classes
+    themselves.
+    """
+
+    # The setting this floor guards, and the instance attribute a declaration
+    # materialises on ``Settings`` to authorise one emptying save.
+    KEY: ClassVar[str]
+    FLAG: ClassVar[str]
+    # What "the file parses and says nothing at all about KEY" looks like, as
+    # opposed to "the file could not be read" (see Settings._stored_value).
+    ABSENT: ClassVar[Any]
+
+    # Prose slots for the two refusal lines. Raw English, matching the idiom of
+    # the surrounding log lines so no lang/*.json entry is needed.
+    REFUSAL: ClassVar[str]  # "an empty games-to-watch list"
+    CLEARED: ClassVar[str]  # "it to be cleared"
+    CLEARED_LONG: ClassVar[str]  # same, spelled out where the subject is far away
+    CONSEQUENCE: ClassVar[str]  # "an empty list means nothing gets mined"
+    NOUN: ClassVar[str]  # "list"
+    CONTENTS: ClassVar[str]  # "games"
+
+    _RESTORE_LINE: ClassVar[str] = (
+        "Refused to save {refusal} over the stored {stored} - nobody asked for "
+        "{cleared}, and {consequence}. Restoring the stored {noun}."
+    )
+    _UNREADABLE_LINE: ClassVar[str] = (
+        "Refused to save {refusal}: the stored {path} could not be read, so the "
+        "{contents} it may still hold cannot be told apart from none at all, and "
+        "nobody asked for {cleared_long}. Nothing was written - the unreadable file "
+        "is left in place, so recover any values you need from it, then fix or "
+        "delete it."
+    )
+
+    @classmethod
+    def enables_nothing(cls, value: Any) -> bool:
+        """True when this value would leave the miner with nothing to mine."""
+        raise NotImplementedError
+
+    @classmethod
+    def salvage(cls, raw: Any) -> Any | None:
+        """The stored value, cleaned - or ``None`` when it cannot be read.
+
+        ``None`` is never "the stored value is empty": conflating the two is
+        what let a settings.json corrupted mid-run read back as "nothing
+        stored", so the floor saw nothing worth protecting and the atomic
+        replace then destroyed the only remaining copy of it.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def copy(cls, value: Any) -> Any:
+        """A private copy of ``value``, so memory and payload do not alias."""
+        raise NotImplementedError
+
+    @classmethod
+    def restore_message(cls, stored: Any) -> str:
+        return cls._RESTORE_LINE.format(
+            refusal=cls.REFUSAL,
+            stored=stored,
+            cleared=cls.CLEARED,
+            consequence=cls.CONSEQUENCE,
+            noun=cls.NOUN,
+        )
+
+    @classmethod
+    def unreadable_message(cls) -> str:
+        return cls._UNREADABLE_LINE.format(
+            refusal=cls.REFUSAL,
+            path=SETTINGS_PATH,
+            contents=cls.CONTENTS,
+            cleared_long=cls.CLEARED_LONG,
+        )
+
+
+class WatchlistFloor(MiningFloor):
+    """``games_to_watch`` may not go from a stored list to ``[]`` unasked."""
+
+    KEY = _WATCHLIST_KEY
+    FLAG = "_empty_watchlist_declared"
+    ABSENT: ClassVar[Any] = []
+
+    REFUSAL = "an empty games-to-watch list"
+    CLEARED = "it to be cleared"
+    CLEARED_LONG = "the list to be cleared"
+    CONSEQUENCE = "an empty list means nothing gets mined"
+    NOUN = "list"
+    CONTENTS = "games"
+
+    @classmethod
+    def enables_nothing(cls, value: Any) -> bool:
+        return not value
+
+    @classmethod
+    def salvage(cls, raw: Any) -> list[str] | None:
+        if not isinstance(raw, list):
+            # A hand-edited ``"games_to_watch": "War Thunder"`` is a value this
+            # code cannot read, not an empty list.
+            return None
+        names = [game for game in raw if isinstance(game, str)]
+        if raw and not names:
+            # Something is stored, and none of it is a game name this code can
+            # read. Silently filtering it down to [] would let the save through.
+            return None
+        return names
+
+    @classmethod
+    def copy(cls, value: Any) -> list[str]:
+        return list(value)
+
+
+class MiningBenefitsFloor(MiningFloor):
+    """``mining_benefits`` may not go from enabling something to enabling nothing.
+
+    The un-floored twin of the watch list, and strictly quieter: emptying the
+    watch list at least shows an empty picker, while turning every benefit type
+    off leaves the whole Settings tab looking normal and the games still listed.
+    ``StreamSelector`` drops every drop whose benefits are all unwanted, so the
+    wanted-game tree comes out empty and the miner idles forever.
+    """
+
+    KEY = _BENEFITS_KEY
+    FLAG = "_disabled_benefits_declared"
+    ABSENT: ClassVar[Any] = {}
+
+    REFUSAL = "a mining-benefits selection with every benefit type disabled"
+    CLEARED = "them all to be turned off"
+    CLEARED_LONG = "them all to be turned off"
+    CONSEQUENCE = "with none of them enabled no drop is worth mining"
+    NOUN = "selection"
+    CONTENTS = "benefit types"
+
+    @classmethod
+    def enables_nothing(cls, value: Any) -> bool:
+        # Not a dict counts as "enables nothing" on purpose: is_wanted() would
+        # raise or answer False for every lookup against it, which is the same
+        # outage, so it gets the same floor rather than a crash at watch time.
+        return not isinstance(value, dict) or not any(value.values())
+
+    @classmethod
+    def salvage(cls, raw: Any) -> dict[str, bool] | None:
+        if not isinstance(raw, dict):
+            return None
+        flags = {
+            key: value
+            for key, value in raw.items()
+            if key in MINING_BENEFIT_KEYS and isinstance(value, bool)
+        }
+        if raw and not flags:
+            # Stored, and not one readable benefit flag in it - the dict
+            # equivalent of ["War Thunder"] stored as a bare string.
+            return None
+        return flags
+
+    @classmethod
+    def copy(cls, value: Any) -> dict[str, bool]:
+        return dict(value)
+
+
 @dataclass
 class Settings:
     connection_quality: int
@@ -274,15 +543,20 @@ class Settings:
     prediction_channels: list[str]
     channel_strategies: dict[str, str]
 
-    # Save-side floor state (see save()). A CLASS-level default, deliberately
-    # unannotated so @dataclass does not mistake it for a field, and deliberately
-    # not initialized in __init__: only declare_empty_watchlist_intent() ever
-    # creates the instance attribute, and save() removes it again. So it stays
-    # out of vars(self) - which is both what json_save serializes and what
+    # Save-side floor state (see save()). CLASS-level defaults, deliberately
+    # unannotated so @dataclass does not mistake them for fields, and deliberately
+    # not initialized in __init__: only the matching declare_*_intent() method
+    # ever creates the instance attribute, and save() removes it again. So they
+    # stay out of vars(self) - which is both what json_save serializes and what
     # SettingsManager.get_settings() hands to /api/settings - instead of showing
-    # up there as a setting that does not exist. The class attribute itself is
-    # only ever READ; nothing mutates it, so this is not shared state.
+    # up there as settings that do not exist. The class attributes themselves are
+    # only ever READ; nothing mutates them, so this is not shared state.
     _empty_watchlist_declared = False
+    _disabled_benefits_declared = False
+
+    # Every "emptying this stops the miner" rule save() enforces, in the order
+    # it enforces them. Unannotated for the same reason as the flags above.
+    _FLOORS = (WatchlistFloor, MiningBenefitsFloor)
 
     def __init__(self):
         self.load()
@@ -298,17 +572,24 @@ class Settings:
         # is usable, so a poisoned language has to be repaired here - before it
         # is setattr-ed and handed to the translator.
         settings["language"] = LanguageNormalizer.repair(settings.get("language"))
+        # Same reasoning, same reason it cannot heal itself: a stored
+        # scheduler boundary is only ever re-posted by the UI as the value it
+        # already is, and check_and_update_setting short-circuits on equality,
+        # so a poisoned one survives every restart until it is repaired here.
+        for boundary in ("scheduler_start", "scheduler_stop"):
+            settings[boundary] = ClockTime.repair(settings.get(boundary), boundary)
         for key, value in settings.items():
             setattr(self, key, value)
 
     def declare_empty_watchlist_intent(self) -> None:
         """Declare that the NEXT save may persist an empty watch list.
 
-        The only way past the floor in :meth:`save`, and deliberately a method
-        rather than a value anyone can assign: a caller has to name the intent to
-        get it. It is per-instance state, not module state, and it is consumed by
-        the first following save, so permission granted for one deliberate
-        "clear all" cannot linger and wave through an accidental wipe later.
+        One of the two ways past the floors in :meth:`save`, and deliberately a
+        method rather than a value anyone can assign: a caller has to name the
+        intent to get it. It is per-instance state, not module state, and it is
+        consumed by the first following save, so permission granted for one
+        deliberate "clear all" cannot linger and wave through an accidental wipe
+        later.
 
         The name deliberately does NOT match the ``allow_empty_games_to_watch``
         payload key: that key must never exist as an attribute of this object
@@ -322,8 +603,24 @@ class Settings:
         """
         self._empty_watchlist_declared = True
 
-    def _stored_games_to_watch(self) -> list[str] | None:
-        """The watch list as it currently is ON DISK - the state the floor guards.
+    def declare_disabled_benefits_intent(self) -> None:
+        """Declare that the NEXT save may persist an all-disabled benefit selection.
+
+        The ``mining_benefits`` twin of :meth:`declare_empty_watchlist_intent`,
+        with the same one-shot semantics and the same reason for existing:
+        turning every benefit type off is a legitimate gesture (it is how a user
+        says "pause mining but keep my watch list"), so it is not banned - it
+        just has to be asked for, because the same value arriving unasked means
+        the miner silently stops.
+
+        Its payload key is ``allow_empty_mining_benefits``, and as above the
+        names are deliberately different so the request-only flag can never
+        become an attribute of this object.
+        """
+        self._disabled_benefits_declared = True
+
+    def _stored_value(self, floor: type[MiningFloor]) -> Any | None:
+        """A guarded setting as it currently is ON DISK - the state the floor guards.
 
         Read at save time rather than remembered from load time, because the
         question is what this save is about to overwrite: a load that fell back
@@ -332,28 +629,29 @@ class Settings:
         case already got wrong.
 
         Fails CLOSED, which is what the three-way return type is for. Answering
-        "I could not read the stored list" with ``[]`` made it identical to
-        "there is genuinely nothing stored", and that single confusion bypassed
-        both protections at once: a settings.json corrupted while the process ran
-        read back as ``[]``, so the floor saw nothing worth protecting, no-oped,
-        and the atomic replace then destroyed the corrupt bytes - the only
-        remaining copy of the operator's list - behind one WARNING.
+        "I could not read the stored value" with an empty one made it identical
+        to "there is genuinely nothing stored", and that single confusion
+        bypassed both protections at once: a settings.json corrupted while the
+        process ran read back as ``[]``, so the floor saw nothing worth
+        protecting, no-oped, and the atomic replace then destroyed the corrupt
+        bytes - the only remaining copy of the operator's list - behind one
+        WARNING.
 
-        - ``[]`` - there is genuinely nothing stored: no file yet (a fresh
-          install MUST be able to write its first settings.json) or a file that
-          parses and carries no watch list at all.
-        - ``None`` - the stored list could not be read: the file exists but does
-          not parse, or ``games_to_watch`` is not a list, or it is a non-empty
-          list holding no usable name (``[123, 456]``). The caller must not treat
-          any of those as "the list is empty".
-        - a list of names - what this save would overwrite. Non-string entries
-          are dropped, but only while at least one real name survives.
+        - ``floor.ABSENT`` (``[]`` / ``{}``) - there is genuinely nothing
+          stored: no file yet (a fresh install MUST be able to write its first
+          settings.json) or a file that parses and carries no such key at all.
+        - ``None`` - the stored value could not be read: the file exists but does
+          not parse, or the key holds the wrong type, or it holds a non-empty
+          value with nothing usable in it (``[123, 456]``). The caller must not
+          treat any of those as "the value is empty".
+        - anything else - what this save would overwrite, cleaned by
+          :meth:`MiningFloor.salvage`.
 
         Deliberately read WITHOUT ``quarantine=True``, even though every other
         read of settings.json passes it. Quarantining renames the file to
         settings.json.corrupt, which leaves no settings.json at all - and the very
         next save would then read "no file, nothing stored" and write the empty
-        list unchallenged, re-creating the loss this refusal exists to prevent,
+        value unchallenged, re-creating the loss this refusal exists to prevent,
         one step later. Refusing the save instead leaves the bytes exactly where
         they are, under their real name, where the boot path's own
         ``quarantine=True`` load preserves them with the recovery message the
@@ -362,10 +660,10 @@ class Settings:
         if not SETTINGS_PATH.exists():
             # Nothing is stored yet, so nothing can be lost - and the first save
             # of a fresh install has to be allowed to land.
-            return []
+            return floor.ABSENT
         # merge=False: only the one key matters here, and merging the full
-        # default template in would report a defaults-shaped list as "stored".
-        unreadable: JsonType = {_WATCHLIST_KEY: _UNREADABLE}
+        # default template in would report a defaults-shaped value as "stored".
+        unreadable: JsonType = {floor.KEY: _UNREADABLE}
         try:
             stored = json_load(SETTINGS_PATH, unreadable, merge=False)
         except (AttributeError, TypeError):
@@ -375,81 +673,71 @@ class Settings:
             # stored", and the whole point of this method is that the floor never
             # has to guess which kind of unreadable it got.
             return None
-        games = stored.get(_WATCHLIST_KEY, [])
-        if games is _UNREADABLE or not isinstance(games, list):
+        raw = stored.get(floor.KEY, floor.ABSENT)
+        if raw is _UNREADABLE:
             return None
-        names = [game for game in games if isinstance(game, str)]
-        if games and not names:
-            # Something is stored, and none of it is a game name this code can
-            # read. Silently filtering it down to [] would let the save through.
-            return None
-        return names
+        return floor.salvage(raw)
 
     def save(self) -> None:
-        """Persist the settings, refusing to write a watch list nobody emptied.
+        """Persist the settings, refusing to write an emptiness nobody asked for.
 
-        The rule, in one sentence: an empty ``games_to_watch`` is persisted only
-        when the emptying was declared through
-        :meth:`declare_empty_watchlist_intent`; any other save that would write
-        ``[]`` over a non-empty stored list restores the stored list, in memory
-        and on disk, and says so at ERROR level.
+        The rule, in one sentence: a guarded setting (see :class:`MiningFloor`)
+        may only be persisted in its mine-nothing state when that state was
+        declared through the matching ``declare_*_intent`` method; any other save
+        that would write it over a stored value which still enables mining
+        restores the stored value, in memory and on disk, and says so at ERROR
+        level.
 
         Why here and not only at the HTTP boundary: the first fix put this floor
         on the incoming payload, which cannot see the case that actually hurts -
-        the in-memory list becoming ``[]`` without any payload at all (a corrupt
-        load, a rogue mutation, a future cleaner) and then being cemented by an
+        the in-memory value emptying without any payload at all (a corrupt load,
+        a rogue mutation, a future cleaner) and then being cemented by an
         unrelated save such as a dark-mode toggle. The invariant belongs on the
         stored state, so it is enforced against the stored state, at the one point
         where memory becomes disk.
 
-        The in-memory list is healed too, not just the file. Leaving memory empty
-        while disk holds the games would keep mining stopped until a restart and
-        show the operator a UI that disagrees with their settings file; failing
-        towards "mine what you asked for" is the safe direction, and the ERROR
-        line plus a watch list that visibly comes back is a far better signal
-        than five silent days.
+        The in-memory value is healed too, not just the file. Leaving memory
+        empty while disk holds the games would keep mining stopped until a
+        restart and show the operator a UI that disagrees with their settings
+        file; failing towards "mine what you asked for" is the safe direction,
+        and the ERROR line plus a watch list that visibly comes back is a far
+        better signal than five silent days.
 
-        A save that cannot read the stored list writes NOTHING - see
-        :meth:`_stored_games_to_watch`. Refusing costs the other settings in the
-        same save; letting it through costs the operator's watch list and the
-        only copy of the file it was in.
+        A save that cannot read the stored value writes NOTHING - see
+        :meth:`_stored_value`. Refusing costs the other settings in the same
+        save; letting it through costs the operator's configuration and the only
+        copy of the file it was in.
         """
-        declared = self._empty_watchlist_declared
+        declared = {floor.FLAG: getattr(self, floor.FLAG) for floor in self._FLOORS}
         payload = {key: value for key, value in vars(self).items() if not key.startswith("_")}
-        if not payload.get(_WATCHLIST_KEY) and not declared:
-            stored = self._stored_games_to_watch()
+        for floor in self._FLOORS:
+            if declared[floor.FLAG] or not floor.enables_nothing(payload.get(floor.KEY)):
+                continue
+            stored = self._stored_value(floor)
             if stored is None:
-                logger.error(
-                    "Refused to save an empty games-to-watch list: the stored "
-                    f"{SETTINGS_PATH} could not be read, so the games it may still hold "
-                    "cannot be told apart from none at all, and nobody asked for the list "
-                    "to be cleared. Nothing was written - the unreadable file is left in "
-                    "place, so recover any values you need from it, then fix or delete it."
-                )
+                logger.error(floor.unreadable_message())
                 return
-            if stored:
-                logger.error(
-                    "Refused to save an empty games-to-watch list over the stored "
-                    f"{stored} - nobody asked for it to be cleared, and an empty list "
-                    "means nothing gets mined. Restoring the stored list."
-                )
-                payload[_WATCHLIST_KEY] = stored
-                self.games_to_watch = list(stored)
-        # Consume the declaration for the write it authorised, and only for a
+            if not floor.enables_nothing(stored):
+                logger.error(floor.restore_message(stored))
+                payload[floor.KEY] = stored
+                setattr(self, floor.KEY, floor.copy(stored))
+        # Consume the declarations for the write they authorised, and only for a
         # write that actually lands. Popping rather than assigning False keeps
         # the instance dict - and therefore every payload derived from
-        # vars(self) - free of it while json_save serializes; restoring it if
+        # vars(self) - free of them while json_save serializes; restoring them if
         # json_save raises keeps the user's "clear all" alive across a failed
         # write. Burning it there was a regression in the making: the retry, or
         # any later save, would find the permission spent, hit the floor above
         # and RESURRECT the games the user had just deleted - while blaming
         # "nobody asked for it to be cleared" for a deletion somebody did ask
-        # for. A declaration that lingers can only ever authorise the empty list
+        # for. A declaration that lingers can only ever authorise the empty value
         # the user already asked for, which is the harmless direction.
-        self.__dict__.pop("_empty_watchlist_declared", None)
+        for floor in self._FLOORS:
+            self.__dict__.pop(floor.FLAG, None)
         try:
             json_save(SETTINGS_PATH, payload, sort=True)
         except BaseException:
-            if declared:
-                self._empty_watchlist_declared = True
+            for floor in self._FLOORS:
+                if declared[floor.FLAG]:
+                    setattr(self, floor.FLAG, True)
             raise

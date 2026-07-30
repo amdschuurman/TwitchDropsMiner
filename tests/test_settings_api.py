@@ -18,6 +18,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 # The exact line the server must log when it declines a watch-list wipe.
 REFUSAL_LINE = "Refused to clear the games-to-watch list without explicit intent"
 
+# "this argument was not passed", as distinct from "this argument was passed as
+# None" - which is itself one of the cases under test.
+_UNSET = object()
+
 
 def without_loaded_language(name: str):
     """Patch the translator as if ``lang/<name>.json`` had failed to parse.
@@ -81,7 +85,10 @@ class TestSettingsAPI(unittest.IsolatedAsyncioTestCase):
         mock_settings = MagicMock(spec=Settings)
         # Initialize mock attributes with default values for comparison
         mock_settings.inventory_filters = {}
-        mock_settings.mining_benefits = {}
+        # The real stored shape: all four benefit types, all enabled. An empty
+        # dict here would make the merge below indistinguishable from the
+        # wholesale replacement it exists to replace.
+        mock_settings.mining_benefits = dict(default_settings["mining_benefits"])
         mock_settings.games_to_watch = []
         # update_settings() reads make_predictions unconditionally (predictions
         # enable-transition detection); real Settings.load() always provides it.
@@ -103,12 +110,16 @@ class TestSettingsAPI(unittest.IsolatedAsyncioTestCase):
             "Setting changed: inventory_filters = {'show_upcoming': False}"
         )
 
-        # 2. Update Mining Benefits (SHOULD trigger callback)
-        benefits = {"BADGE": False}
-        manager.update_settings({"mining_benefits": benefits})
+        # 2. Update Mining Benefits (SHOULD trigger callback). The payload is
+        # MERGED onto the stored selection, not substituted for it: an omitted
+        # key means "not supplied", the same meaning every other absent value
+        # has here. See TestMiningBenefitsAreMerged for why.
+        manager.update_settings({"mining_benefits": {"BADGE": False}})
         mock_callback.assert_called_once()
-        self.assertEqual(mock_settings.mining_benefits, benefits)
-        mock_console.print.assert_called_with("Setting changed: mining_benefits = {'BADGE': False}")
+        self.assertEqual(
+            mock_settings.mining_benefits,
+            dict(default_settings["mining_benefits"]) | {"BADGE": False},
+        )
         mock_callback.reset_mock()
 
         # 3. Update Games to Watch (SHOULD trigger callback)
@@ -148,6 +159,9 @@ class SettingsManagerTestBase(NoStrayTasksTestCase):
         self.settings = MagicMock(spec=Settings)
         self.settings.games_to_watch = ["Overwatch"]
         self.settings.language = "English"
+        # The stored benefit selection is merged onto, so it has to be the real
+        # shape or the merge cannot be told from a replacement.
+        self.settings.mining_benefits = dict(default_settings["mining_benefits"])
         # update_settings() reads make_predictions unconditionally.
         self.settings.make_predictions = False
         self.console = MagicMock()
@@ -180,9 +194,15 @@ class TestGamesToWatchClearGuard(SettingsManagerTestBase):
         self.settings.save.assert_called_once()
 
     async def test_empty_list_with_explicit_intent_is_applied(self):
-        # The user really can still clear their list ("Deselect All").
+        # The user really can still clear their list ("Deselect All"). A clear
+        # also has to name the list it believed was stored - see
+        # TestWatchlistClearChecksTheClientIsUpToDate.
         self.manager.update_settings(
-            {"games_to_watch": [], "allow_empty_games_to_watch": True}
+            {
+                "games_to_watch": [],
+                "allow_empty_games_to_watch": True,
+                "expected_games_to_watch": ["Overwatch"],
+            }
         )
 
         self.assertEqual(self.settings.games_to_watch, [])
@@ -191,13 +211,19 @@ class TestGamesToWatchClearGuard(SettingsManagerTestBase):
         self.assertIn("Setting changed: games_to_watch = []", lines)
 
     async def test_intent_flag_never_lands_on_the_settings_object(self):
-        payload = {"games_to_watch": [], "allow_empty_games_to_watch": True}
+        payload = {
+            "games_to_watch": [],
+            "allow_empty_games_to_watch": True,
+            "expected_games_to_watch": ["Overwatch"],
+        }
+        original = dict(payload)
         self.manager.update_settings(payload)
 
-        self.assertFalse(hasattr(self.settings, "allow_empty_games_to_watch"))
-        # It is popped off a COPY, so the caller's dict is left alone too.
-        self.assertEqual(payload, {"games_to_watch": [], "allow_empty_games_to_watch": True})
-        self.assertNotIn("allow_empty_games_to_watch", " ".join(self.console_lines()))
+        for key in ("allow_empty_games_to_watch", "expected_games_to_watch"):
+            self.assertFalse(hasattr(self.settings, key))
+            self.assertNotIn(key, " ".join(self.console_lines()))
+        # They are popped off a COPY, so the caller's dict is left alone too.
+        self.assertEqual(payload, original)
 
     async def test_intent_flag_alone_does_not_touch_the_list(self):
         self.manager.update_settings({"allow_empty_games_to_watch": True, "dark_mode": True})
@@ -245,6 +271,142 @@ class TestGamesToWatchClearGuard(SettingsManagerTestBase):
 
         self.assertIn(REFUSAL_LINE, self.console_lines())
         self.assertEqual(self.settings.games_to_watch, ["Overwatch", "Rust"])
+
+
+class TestWatchlistClearChecksTheClientIsUpToDate(SettingsManagerTestBase):
+    """A clear must also name the list the client believed was stored.
+
+    The intent flag alone was not enough, and this is the hole four review
+    passes named. ``saveSettings`` POSTs the client's ENTIRE list as
+    authoritative, and every single-game-removal gesture carries
+    ``allow_empty_games_to_watch`` so that removing your last game works. So a
+    tab that loaded while the list was ``['A']``, clicking the last cross it can
+    see, sends a request byte-identical to a user deliberately clearing a
+    three-game list: same empty list, same flag. Three games are wiped, the
+    server declares the intent on the client's behalf, and the save-side floor
+    waves it through because the intent was declared.
+
+    The flag says "emptying is deliberate". It does not say "emptying THIS list
+    is deliberate", and only the second one is safe. So the destructive case -
+    and only that case - also carries ``expected_games_to_watch``, and is
+    refused when it no longer matches.
+    """
+
+    STALE = (
+        "Refused to clear the games-to-watch list: this request expected ['Overwatch'] to be "
+        "stored, but the stored list is ['Overwatch', 'Rust']"
+    )
+    UNSTATED = (
+        "Refused to clear the games-to-watch list: this request did not say which list it "
+        "believed was stored (expected_games_to_watch was None)"
+    )
+
+    def clear(self, expected=_UNSET):
+        payload = {"games_to_watch": [], "allow_empty_games_to_watch": True}
+        if expected is not _UNSET:
+            payload["expected_games_to_watch"] = expected
+        self.manager.update_settings(payload)
+
+    def refusal(self) -> str:
+        clears = [
+            line for line in self.console_lines()
+            if line.startswith("Refused to clear the games-to-watch list")
+        ]
+        self.assertEqual(len(clears), 1, self.console_lines())
+        return clears[0]
+
+    async def test_a_matching_expectation_clears_the_list(self):
+        self.clear(["Overwatch"])
+
+        self.assertEqual(self.settings.games_to_watch, [])
+        self.assertIn("Setting changed: games_to_watch = []", self.console_lines())
+        self.settings.declare_empty_watchlist_intent.assert_called_once()
+
+    async def test_a_stale_expectation_is_refused_and_the_list_survives(self):
+        # The reproduction: the tab loaded at ['Overwatch'], two more games were
+        # added elsewhere, and the tab clicks the only cross it can see.
+        self.settings.games_to_watch = ["Overwatch", "Rust"]
+
+        self.clear(["Overwatch"])
+
+        self.assertEqual(self.settings.games_to_watch, ["Overwatch", "Rust"])
+        self.assertIn(self.STALE, self.refusal())
+        # ...and the save is never authorised, or the floor would pass it too.
+        self.settings.declare_empty_watchlist_intent.assert_not_called()
+
+    async def test_a_clear_that_names_no_expectation_is_refused(self):
+        # Every client that predates this field, and every script written
+        # against the old contract. Failing closed is the only safe default:
+        # the request cannot prove it knows what it is deleting.
+        self.clear()
+
+        self.assertEqual(self.settings.games_to_watch, ["Overwatch"])
+        self.assertIn(self.UNSTATED, self.refusal())
+
+    async def test_the_same_names_in_a_different_order_are_refused(self):
+        # List order IS mining order (src/services/stream_selector.py builds the
+        # wanted tree from it), so a client holding a different order is looking
+        # at a different setting and is not the one that wrote it.
+        self.settings.games_to_watch = ["Overwatch", "Rust"]
+
+        self.clear(["Rust", "Overwatch"])
+
+        self.assertEqual(self.settings.games_to_watch, ["Overwatch", "Rust"])
+        self.assertIn("Refused to clear the games-to-watch list", self.refusal())
+
+    async def test_an_already_empty_stored_list_needs_no_expectation(self):
+        # Nothing is stored, so nothing can be lost and no client can be stale
+        # about it. Demanding a match would refuse the first "clear all" of a
+        # fresh install for no gain - and refuse the second gesture of a real
+        # one, whose settings_updated broadcast has not landed yet.
+        self.settings.games_to_watch = []
+
+        self.clear()
+
+        self.assertNotIn(
+            "Refused to clear the games-to-watch list", " ".join(self.console_lines())
+        )
+
+    async def test_a_non_empty_write_ignores_the_expectation_entirely(self):
+        # Normal saves must cost nothing: this is a guard on the destructive
+        # case, not a general optimistic-concurrency scheme.
+        self.settings.games_to_watch = ["Overwatch", "Rust"]
+
+        self.manager.update_settings(
+            {"games_to_watch": ["Rust"], "expected_games_to_watch": ["nonsense"]}
+        )
+
+        self.assertEqual(self.settings.games_to_watch, ["Rust"])
+        self.assertNotIn(
+            "Refused to clear the games-to-watch list", " ".join(self.console_lines())
+        )
+
+    async def test_a_refusal_leaves_the_rest_of_the_request_applied(self):
+        self.settings.games_to_watch = ["Overwatch", "Rust"]
+
+        self.manager.update_settings(
+            {
+                "games_to_watch": [],
+                "allow_empty_games_to_watch": True,
+                "expected_games_to_watch": ["Overwatch"],
+                "dark_mode": True,
+            }
+        )
+
+        self.assertIs(self.settings.dark_mode, True)
+        self.assertEqual(self.settings.games_to_watch, ["Overwatch", "Rust"])
+
+    async def test_the_refusal_names_the_list_the_operator_still_has(self):
+        # The client resyncs from the response, but the console line is what the
+        # operator reads, and "it was refused" without "you still have these" is
+        # an instruction to guess.
+        self.settings.games_to_watch = ["Overwatch", "Rust"]
+
+        self.clear(["Overwatch"])
+
+        line = self.refusal()
+        self.assertIn("['Overwatch', 'Rust']", line)
+        self.assertIn("Reload the page and try again", line)
 
 
 class RaisingActionTestBase(SettingsManagerTestBase):
@@ -598,14 +760,36 @@ class TestWatchlistGuardPersistence(NoStrayTasksTestCase):
 
     async def test_explicit_clear_is_persisted_without_the_intent_flag(self):
         self.manager.update_settings(
-            {"games_to_watch": [], "allow_empty_games_to_watch": True}
+            {
+                "games_to_watch": [],
+                "allow_empty_games_to_watch": True,
+                "expected_games_to_watch": ["Overwatch"],
+            }
         )
 
         self.assertEqual(self.settings.games_to_watch, [])
         stored = self.stored()
         self.assertEqual(stored["games_to_watch"], [])
-        self.assertNotIn("allow_empty_games_to_watch", stored)
-        self.assertFalse(hasattr(self.settings, "allow_empty_games_to_watch"))
+        for key in ("allow_empty_games_to_watch", "expected_games_to_watch"):
+            self.assertNotIn(key, stored)
+            self.assertFalse(hasattr(self.settings, key))
+
+    async def test_a_stale_clear_never_reaches_disk(self):
+        # End to end over a real file: the refusal has to survive the save that
+        # follows it, or the guard is decoration.
+        self.settings.games_to_watch = ["Overwatch", "Rust"]
+        self.settings.save()
+
+        self.manager.update_settings(
+            {
+                "games_to_watch": [],
+                "allow_empty_games_to_watch": True,
+                "expected_games_to_watch": ["Overwatch"],
+            }
+        )
+
+        self.assertEqual(self.stored()["games_to_watch"], ["Overwatch", "Rust"])
+        self.assertEqual(self.settings.games_to_watch, ["Overwatch", "Rust"])
 
     async def test_rejected_language_is_never_written_to_disk(self):
         self.manager.update_settings({"language": "", "dark_mode": True})
@@ -981,8 +1165,11 @@ class TestUnreadableStoredListRefusesTheSave(RealSettingsFileTestBase):
         self.assert_refused(self.running_miner(text), text)
 
     def test_a_top_level_array_refuses_the_save(self):
-        # json_load only handles a JSON object at the top level and raises on
-        # its way out for anything else; the floor must fail closed on that too.
+        # json_load treats a top-level non-object as corrupt and hands back the
+        # defaults it was given, which for this read is the _UNREADABLE sentinel
+        # - so the floor still fails closed, now without an exception in the
+        # path. (It used to raise AttributeError on its way out; the except
+        # clause in _stored_value that caught that is now defence in depth.)
         text = '["War Thunder", "Overwatch 2"]'
 
         self.assert_refused(self.running_miner(text), text)

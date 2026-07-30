@@ -5,9 +5,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
-from src.config.settings import LanguageNormalizer
+from src.config.settings import (
+    MINING_BENEFIT_KEYS,
+    ClockTime,
+    LanguageNormalizer,
+    MiningBenefitsFloor,
+    MiningFloor,
+    WatchlistFloor,
+)
 from src.i18n.translator import _
 from src.models.game import Game
 
@@ -18,9 +25,14 @@ logger = logging.getLogger("TwitchDrops")
 # rolled back to genuinely-absent instead of to None.
 _MISSING = object()
 
-# Request-only intent flag (see SettingsManager.update_settings): it travels on
-# the /api/settings payload but is NEVER a persisted setting.
+# Request-only keys (see SettingsManager._consume_mining_intents): they travel on
+# the /api/settings payload but are NEVER persisted settings. Every one of them
+# is popped off a copy of the payload before any per-key write runs, so none can
+# be setattr-ed onto Settings or serialized into settings.json.
 _ALLOW_EMPTY_GAMES_KEY = "allow_empty_games_to_watch"
+_ALLOW_EMPTY_BENEFITS_KEY = "allow_empty_mining_benefits"
+_EXPECTED_GAMES_KEY = "expected_games_to_watch"
+_REQUEST_ONLY_KEYS = (_ALLOW_EMPTY_GAMES_KEY, _ALLOW_EMPTY_BENEFITS_KEY, _EXPECTED_GAMES_KEY)
 
 
 if TYPE_CHECKING:
@@ -29,12 +41,150 @@ if TYPE_CHECKING:
     from src.web.managers.console import ConsoleOutputManager
 
 
+class _EmptyingGuard:
+    """The payload-side half of one "emptying this setting stops mining" rule.
+
+    Every guarded setting has two halves. The save-side floor
+    (:class:`~src.config.settings.MiningFloor`) protects what is ON DISK from a
+    value that emptied with no request behind it. This half protects the
+    IN-MEMORY value from a request that empties it without saying so - which
+    matters because the in-memory value is what the miner reads, what the
+    dashboard is shown, and what ``_on_change`` recomputes ``wanted_games`` from.
+
+    The two halves share :attr:`FLOOR`, so "this value would leave nothing to
+    mine" has exactly one definition. Letting them drift would mean a payload
+    this half waves through and the floor then silently refuses: an HTTP 200
+    reporting a change that never reached disk.
+
+    Used as classes, not instances - there is one of each and they hold no state.
+    """
+
+    FLOOR: ClassVar[type[MiningFloor]]
+    # The request-only flag that authorises the emptying, the Settings method
+    # that passes that authorisation down to the save, and the line logged when
+    # the emptying is refused instead.
+    ALLOW_KEY: ClassVar[str]
+    DECLARE: ClassVar[str]
+    REFUSAL: ClassVar[str]
+
+    @classmethod
+    def resolve(cls, incoming: Any, stored: Any) -> Any:
+        """What the payload really asks this setting to become."""
+        return incoming
+
+    @classmethod
+    def refuse(cls, request: dict[str, Any], stored: Any) -> str | None:
+        """``None`` to allow the emptying, or the line explaining the refusal."""
+        if not request.get(cls.ALLOW_KEY):
+            return cls.REFUSAL
+        return None
+
+
+class _WatchlistGuard(_EmptyingGuard):
+    """``games_to_watch`` may only be emptied by a client that is up to date.
+
+    The intent flag alone was not enough. ``saveSettings`` posts the client's
+    ENTIRE list as authoritative, and the four single-game-removal gestures all
+    carry the flag so that removing your last game works - so a tab that loaded
+    while the list was ``['A']``, clicking the last ✕ it can see, sends exactly
+    the same request as a user deliberately clearing a three-game list. Three
+    games are wiped and the server declares the intent on the client's behalf,
+    because from the payload alone the two are identical.
+
+    So the destructive case - and ONLY the destructive case - also has to state
+    what the client believed was stored. A non-empty ``games_to_watch`` is
+    untouched by this, so normal saves cost nothing.
+    """
+
+    FLOOR = WatchlistFloor
+    ALLOW_KEY = _ALLOW_EMPTY_GAMES_KEY
+    DECLARE = "declare_empty_watchlist_intent"
+    REFUSAL = "Refused to clear the games-to-watch list without explicit intent"
+
+    @classmethod
+    def refuse(cls, request: dict[str, Any], stored: Any) -> str | None:
+        refusal = super().refuse(request, stored)
+        if refusal is not None:
+            return refusal
+        current = list(stored or [])
+        if not current:
+            # Nothing is stored, so nothing can be lost and no client can be
+            # stale about it. Demanding a match here would refuse the very first
+            # "clear all" of a fresh install for no gain.
+            return None
+        expected = request.get(_EXPECTED_GAMES_KEY)
+        if isinstance(expected, list) and expected == current:
+            return None
+        # Compared in ORDER, not as a set: the order of this list is the mining
+        # order (src/services/stream_selector.py builds the wanted tree from it),
+        # so a client holding the same names in a different order is looking at a
+        # different setting and is, by definition, not the one that wrote it.
+        seen = (
+            f"expected {expected} to be stored"
+            if isinstance(expected, list)
+            else f"did not say which list it believed was stored ({_EXPECTED_GAMES_KEY} was "
+            f"{expected!r})"
+        )
+        return (
+            f"Refused to clear the games-to-watch list: this request {seen}, but the stored "
+            f"list is {current}. The page that sent it is out of date, so clearing the list "
+            "would delete games it never showed. Reload the page and try again."
+        )
+
+
+class _BenefitsGuard(_EmptyingGuard):
+    """``mining_benefits`` is merged, not replaced, and may not be emptied unasked.
+
+    Two separate holes, both closed here.
+
+    Replacement was the quiet one. ``Benefit.is_wanted`` is fail-CLOSED
+    (``allowed_benefits.get(name, False)``), so a key the payload omits is not
+    "leave it as it was", it is "turn it off" - and the dashboard builds this
+    dict from four ``document.getElementById(...)?.checked`` reads, each of
+    which yields ``undefined`` for an element that has not rendered, which
+    ``JSON.stringify`` then drops. A partial payload therefore disabled benefit
+    types nobody touched. Merging into the stored selection makes an absent key
+    mean "not supplied", which is the meaning ``check_and_update_setting``
+    already gives to every other absent value.
+
+    Emptying is the loud one made quiet: with every type disabled no drop is
+    wanted, no game is selected, and mining stops as completely as it does with
+    an empty watch list - while the Settings tab still lists every game. It stays
+    possible, because "stop mining but keep my watch list" is a real thing to
+    want, but it has to be asked for.
+    """
+
+    FLOOR = MiningBenefitsFloor
+    ALLOW_KEY = _ALLOW_EMPTY_BENEFITS_KEY
+    DECLARE = "declare_disabled_benefits_intent"
+    REFUSAL = "Refused to disable every mining benefit type without explicit intent"
+
+    @classmethod
+    def resolve(cls, incoming: Any, stored: Any) -> Any:
+        if not isinstance(incoming, dict):
+            return incoming
+        merged: dict[str, Any] = dict(stored) if isinstance(stored, dict) else {}
+        # Keys outside the known benefit types are not settings and are dropped
+        # silently, exactly as merge_json drops them on the next load; letting
+        # them in would put junk in settings.json until that load happened.
+        merged.update(
+            (key, value)
+            for key, value in incoming.items()
+            if key in MINING_BENEFIT_KEYS and isinstance(value, bool)
+        )
+        return merged
+
+
 class SettingsManager:
     """Manages application settings in the web interface.
 
     Provides access to and modification of user preferences including
     game priorities, proxy configuration, and UI preferences.
     """
+
+    # Every payload-side "emptying this stops the miner" rule, in the order
+    # _consume_mining_intents applies them.
+    _GUARDS: tuple[type[_EmptyingGuard], ...] = (_WatchlistGuard, _BenefitsGuard)
 
     def __init__(
         self,
@@ -91,65 +241,82 @@ class SettingsManager:
         """Log setting change to both console and system logger."""
         self._console.print(message)
 
-    def _consume_empty_watchlist_intent(self, settings_data: dict[str, Any]) -> dict[str, Any]:
-        """Strip the request-only intent flag and refuse unintended watch-list wipes.
+    def _consume_mining_intents(self, settings_data: dict[str, Any]) -> dict[str, Any]:
+        """Strip the request-only keys and refuse unintended mining-stopping writes.
 
         This is the server-side floor that protects the miner from ANY client,
-        current or future: an empty ``games_to_watch`` means "mine nothing", so
-        a page load, a socket reconnect or an over-eager cleanup script must
-        never be able to write it. Emptying the list stays possible - the
-        caller just has to say so explicitly by sending
-        ``allow_empty_games_to_watch: true`` in the SAME request (that is what
-        the UI's "clear all" gesture does).
+        current or future. Two settings can silently stop all mining by going
+        empty - ``games_to_watch`` (no game is ever selected) and
+        ``mining_benefits`` (no drop is ever wanted, so no game is ever
+        selected) - so a page load, a socket reconnect or an over-eager cleanup
+        script must never be able to write either of them empty. Both stay
+        emptiable: the caller just has to say so explicitly, in the SAME request,
+        with ``allow_empty_games_to_watch`` / ``allow_empty_mining_benefits``
+        (which is what the UI's "clear all" and "disable everything" gestures
+        do). ``games_to_watch`` additionally has to prove it is not stale - see
+        :class:`_WatchlistGuard`.
 
         Why it lives here and not in the endpoint: every settings write funnels
         through ``update_settings``, so this is the single choke point that no
         writer can go around.
 
-        The intent flag itself is popped off a COPY of the payload before any
-        per-key update runs, which makes it impossible-by-construction for it
-        to be ``setattr``-ed onto ``Settings`` or serialized into settings.json.
+        The request-only keys are popped off a COPY of the payload before any
+        per-key update runs, which makes it impossible-by-construction for one
+        of them to be ``setattr``-ed onto ``Settings`` or serialized into
+        settings.json. They are popped whether or not their guard fires.
 
         There is a SECOND floor under this one, on the save side
-        (``Settings.save`` / ``Settings.declare_empty_watchlist_intent`` in
-        ``src/config/settings.py``): it refuses to write ``[]`` over a non-empty
-        stored list unless this request declared the intent. So when the user
-        really is clearing the list, the intent has to be handed down - otherwise
-        the save-side floor restores the stored list and the user's deliberate
-        "clear all" silently does nothing. This method is the only place that
-        knows the difference, which is why it is the only place that declares it.
-        The declaring method is named differently from the payload key on purpose:
-        ``allow_empty_games_to_watch`` must never exist as an attribute of
-        ``Settings``, or it would be serialized into settings.json as a setting.
+        (``Settings.save`` and the ``declare_*_intent`` methods in
+        ``src/config/settings.py``): it refuses to write a mine-nothing value
+        over a stored one that still enables mining, unless this request
+        declared the intent. So when the user really is clearing something, the
+        intent has to be handed down - otherwise the save-side floor restores the
+        stored value and the user's deliberate gesture silently does nothing.
+        This method is the only place that knows the difference, which is why it
+        is the only place that declares it. Each declaring method is named
+        differently from its payload key on purpose: the keys must never exist as
+        attributes of ``Settings``, or they would be serialized into
+        settings.json as settings.
 
         Args:
             settings_data: Raw settings payload from the caller.
 
         Returns:
-            A copy of the payload without the intent flag, and without
-            ``games_to_watch`` when clearing it was not explicitly requested.
+            A copy of the payload without the request-only keys, with
+            ``mining_benefits`` merged onto the stored selection, and without any
+            guarded key whose emptying was not explicitly (and credibly)
+            requested.
         """
         settings_data = dict(settings_data)
-        allow_empty = bool(settings_data.pop(_ALLOW_EMPTY_GAMES_KEY, None))
-        games = settings_data.get("games_to_watch")
-        if allow_empty and isinstance(games, list) and not games:
-            # Narrow on purpose: only the payload that actually empties the list
-            # declares anything. The declaration is consumed by the next save, so
-            # granting it for a request that does not clear the list would spend
-            # it on a save nobody vetted.
-            self._settings.declare_empty_watchlist_intent()
-        if not allow_empty and isinstance(games, list) and not games:
+        request = {key: settings_data.pop(key, None) for key in _REQUEST_ONLY_KEYS}
+        for guard in self._GUARDS:
+            key = guard.FLOOR.KEY
+            incoming = settings_data.get(key)
+            if incoming is None:
+                continue  # not supplied by this request; nothing to guard
+            stored = getattr(self._settings, key, None)
+            value = guard.resolve(incoming, stored)
+            settings_data[key] = value
+            if not guard.FLOOR.enables_nothing(value):
+                continue
+            refusal = guard.refuse(request, stored)
+            if refusal is None:
+                # Narrow on purpose: only the payload that actually empties the
+                # setting declares anything. The declaration is consumed by the
+                # next save, so granting it for a request that does not empty
+                # anything would spend it on a save nobody vetted.
+                getattr(self._settings, guard.DECLARE)()
+                continue
             # Drop the key entirely: the per-key updater treats a missing value
             # as "not supplied", so every OTHER key in this request still lands.
-            del settings_data["games_to_watch"]
-            if getattr(self._settings, "games_to_watch", None):
-                # Only a list that actually HAD games was protected from being
-                # wiped. On a fresh install the stored list is already empty, so
+            del settings_data[key]
+            if not guard.FLOOR.enables_nothing(stored):
+                # Only a value that actually still enabled mining was protected.
+                # On a fresh install the stored watch list is already empty, so
                 # the same payload refuses nothing - warning about it there just
                 # trains the operator to ignore the line that matters.
-                message = "Refused to clear the games-to-watch list without explicit intent"
-                self._log_change(message)
-                logger.warning(message)
+                self._log_change(refusal)
+                logger.warning(refusal)
         return settings_data
 
     def update_settings(self, settings_data: dict[str, Any]):
@@ -158,7 +325,7 @@ class SettingsManager:
         Args:
             settings_data: Dictionary of settings to update
         """
-        settings_data = self._consume_empty_watchlist_intent(settings_data)
+        settings_data = self._consume_mining_intents(settings_data)
         should_trigger_update = False
         should_trigger_update |= self.check_and_update_setting(
             "games_to_watch", settings_data.get("games_to_watch"), True
@@ -194,6 +361,11 @@ class SettingsManager:
         should_trigger_update |= self.check_and_update_setting(
             "inventory_filters", settings_data.get("inventory_filters")
         )
+        # Already MERGED onto the stored selection by _consume_mining_intents, so
+        # this applies "the four flags as they now are", not "the flags this
+        # payload happened to mention". The equality short-circuit in
+        # check_and_update_setting then makes a payload that changes nothing a
+        # genuine no-op: no console line, no should_trigger_update.
         should_trigger_update |= self.check_and_update_setting(
             "mining_benefits", settings_data.get("mining_benefits"), True
         )
@@ -213,8 +385,16 @@ class SettingsManager:
             "preferred_games", settings_data.get("preferred_games")
         )
         self.check_and_update_setting("scheduler_enabled", settings_data.get("scheduler_enabled"))
-        self.check_and_update_setting("scheduler_start", settings_data.get("scheduler_start"))
-        self.check_and_update_setting("scheduler_stop", settings_data.get("scheduler_stop"))
+        self.check_and_update_setting(
+            "scheduler_start",
+            settings_data.get("scheduler_start"),
+            validator=self._validate_clock_time,
+        )
+        self.check_and_update_setting(
+            "scheduler_stop",
+            settings_data.get("scheduler_stop"),
+            validator=self._validate_clock_time,
+        )
         if any(k in settings_data for k in ("scheduler_enabled", "scheduler_start", "scheduler_stop")):
             if self._on_scheduler_change:
                 self._on_scheduler_change()
@@ -383,6 +563,18 @@ class SettingsManager:
         """
         if not LanguageNormalizer.accepts(language):
             raise ValueError(f"Unrecognized language {language!r}")
+
+    def _validate_clock_time(self, value: Any):
+        """Reject a scheduler boundary the scheduler cannot parse, before it is stored.
+
+        ``SchedulerService._parse_time`` has no guard of its own and nothing
+        catches what it raises, so one ``"banana"`` (or ``""``, ``"22"``,
+        ``"24:00"``, ``"-1:00"``) accepted here kills the scheduler task for the
+        rest of the process - and a miner it had already paused then never
+        resumes. See :class:`~src.config.settings.ClockTime`, which owns the
+        parse so this validator and the scheduler cannot drift apart.
+        """
+        ClockTime.parse(value)
 
     def _set_language(self, language: str):
         _.set_language(language)

@@ -109,9 +109,17 @@ def get_streak_state(channel_login: str) -> dict:
     p = _get_streaks_file()
     try:
         data = _json_mod.loads(p.read_text()) if p.exists() else {}
-        return data.get(channel_login, {})
+        state = data.get(channel_login, {})
     except Exception:
         return {}
+    # The per-channel VALUE was returned unchecked, and it is read by
+    # StreamSelector._has_unclaimed_streak_today, which is the sort key of the
+    # CHANNEL_SWITCH branch of the main loop. A non-object there (a hand edit, a
+    # foreign writer) raises AttributeError inside sorted(), which Twitch.run()
+    # does not recover from: the process exits 1 and restarts into the same file.
+    # Only _mark_streak_claimed writes here, and it always writes an object, so
+    # anything else is corruption and the miner should mine, not die.
+    return state if isinstance(state, dict) else {}
 
 
 def _update_daily_points_server(delta: int, data_dir: "Path") -> None:

@@ -19,6 +19,7 @@ from src.config import GQL_OPERATIONS
 from src.exceptions import ExitRequest
 from src.i18n import _
 from src.models import DropsCampaign
+from src.services.task_supervision import log_task_death
 from src.utils import chunk
 
 
@@ -29,15 +30,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("TwitchDrops")
-
-
-def _log_maintenance_task_result(task: asyncio.Task[Any]) -> None:
-    """Surface unexpected maintenance-task exits so they don't disappear silently."""
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        logger.error("Maintenance task died: %r", exc, exc_info=exc)
 
 
 class InventoryService:
@@ -131,7 +123,7 @@ class InventoryService:
             # Surface task failures via the app logger. Without this, a crash inside
             # run_maintenance_task() shows up only as "Task exception was never retrieved"
             # on stderr, and the periodic inventory refresh silently stops.
-            self._twitch._mnt_task.add_done_callback(_log_maintenance_task_result)
+            self._twitch._mnt_task.add_done_callback(log_task_death("Maintenance task"))
 
     async def _fetch_inventory(self) -> None:
         status_update = self._twitch.gui.status.update

@@ -1,8 +1,12 @@
+import logging
 from datetime import date, datetime, timedelta, timezone
 
 from src.config.settings import Settings
 from src.models.campaign import DropsCampaign
 from src.models.game import Game
+
+
+logger = logging.getLogger("TwitchDrops")
 
 
 class StreamSelector:
@@ -15,17 +19,27 @@ class StreamSelector:
         return last != date.today().isoformat()
 
     def _get_wanted_game_tree(
-        self, settings: Settings, campaigns: list[DropsCampaign]
+        self,
+        settings: Settings,
+        campaigns: list[DropsCampaign],
+        *,
+        report_exclusions: bool = False,
     ) -> list[dict]:
         """
         Get the hierarchical tree of wanted items (Games -> Campaigns -> Drops -> Benefits).
         Ignoring 'can earn within' time constraint.
+
+        ``report_exclusions`` is set by the mining path only. The web path calls
+        this on every dashboard load and every wanted-items broadcast, and a line
+        per call would bury the one that is about a miner deciding it has nothing
+        to do.
         """
         wanted_games = []
         games_to_watch = settings.games_to_watch
         preferred_games = getattr(settings, "preferred_games", [])
         mining_benefits = settings.mining_benefits
         blacklist = [kw.lower() for kw in getattr(settings, "drop_name_blacklist", []) if kw.strip()]
+        blacklisted_drops = 0
         next_hour = datetime.now(timezone.utc) + timedelta(hours=1)
 
         # Build games_to_watch first (preserving user order), then append preferred games
@@ -76,6 +90,7 @@ class StreamSelector:
                     if not drop._base_can_earn():
                         continue
                     if blacklist and any(kw in drop.name.lower() for kw in blacklist):
+                        blacklisted_drops += 1
                         continue
 
                     filtered_benefits = [
@@ -114,6 +129,22 @@ class StreamSelector:
                     }
                 )
 
+        if report_exclusions and blacklisted_drops:
+            # drop_name_blacklist is a plain substring match with no minimum
+            # length, so a single-letter keyword excludes very nearly every drop
+            # and empties this list. The caller then warns "No wanted games
+            # found!" naming only games_to_watch, which sends the operator
+            # looking at the one setting that is not the problem. Loud when it
+            # cost everything, quiet when it did the job it was asked to do.
+            message = (
+                f"drop_name_blacklist excluded {blacklisted_drops} drop(s) this pass "
+                f"(keywords: {', '.join(blacklist)})"
+            )
+            if wanted_games:
+                logger.info(message)
+            else:
+                logger.warning(f"{message} - nothing is left to mine")
+
         return wanted_games
 
     def get_wanted_game_tree(
@@ -124,4 +155,7 @@ class StreamSelector:
         ]
 
     def get_wanted_games(self, settings: Settings, campaigns: list[DropsCampaign]) -> list[Game]:
-        return [game["game_obj"] for game in self._get_wanted_game_tree(settings, campaigns)]
+        return [
+            game["game_obj"]
+            for game in self._get_wanted_game_tree(settings, campaigns, report_exclusions=True)
+        ]

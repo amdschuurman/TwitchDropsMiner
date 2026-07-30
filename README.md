@@ -187,21 +187,53 @@ raised while it sits idle, so that state can only be reached deliberately.
   Any other request that would leave the list empty is ignored, and the server
   logs `Refused to clear the games-to-watch list without explicit intent` to
   the dashboard console.
+- A request that clears the list must also say which list it believed was
+  stored. A dashboard tab left open since before you added a game would
+  otherwise delete games it never showed: removing the last game it can see and
+  clearing a longer list are the same request. When the two disagree the write
+  is refused with `Refused to clear the games-to-watch list: this request
+  expected [...] to be stored, but the stored list is [...]`, the tab resyncs,
+  and you can reload and try again.
 - A value the server rejects (an empty language, for example) is logged as
   `Setting rejected: <key> = <value> (<reason>)` and skipped. The rest of the
   same save still applies, and the rejected value is never stored.
 
-The reason for all three: the dashboard used to run that cleanup on every page
+The reason for all of them: the dashboard used to run that cleanup on every page
 load and socket reconnect and save the result. On 2026-07-24 it emptied the
 watch list of an account watching a single game whose drops were all claimed,
 and the miner mined nothing for the next five days without reporting a problem.
 
+### Other settings that stop mining
+
+An empty watch list is not the only way to end up mining nothing while the
+dashboard looks healthy, so the same shape of protection covers the rest.
+
+- **Mining benefits.** With every benefit type unchecked no drop counts as
+  wanted, so no game is ever selected and mining stops with the whole watch list
+  still on screen. Turning them all off stays possible, because "pause mining
+  but keep my watch list" is a real thing to want, and it takes the same kind of
+  deliberate action as clearing the list. Anything else that would leave nothing
+  enabled is refused with `Refused to disable every mining benefit type without
+  explicit intent`, and `GET /api/health/mining` reports `benefits_disabled`.
+  A save that only mentions some of the four types no longer switches the others
+  off: the selection is merged, not replaced.
+- **Scheduler window.** `scheduler_start` and `scheduler_stop` must be `HH:MM`.
+  A value the scheduler cannot read (`22`, `25:00`, an empty box) used to kill
+  the scheduler task for the rest of the run, and if it had already paused
+  mining nothing was left to lift the pause. Such a value is now rejected on
+  write, and one already sitting in `settings.json` is replaced by the default
+  at the next start, with the reason logged.
+
 ### When `settings.json` cannot be read
 
-A `settings.json` the miner cannot parse (an interrupted write, a bad disk
-block, a hand edit with a comma missing) is no longer quietly replaced by
-defaults. The unreadable file is moved aside to `settings.json.corrupt` next to
-it, and the log says so:
+A `settings.json` the miner cannot parse is no longer quietly replaced by
+defaults. That covers an interrupted write, a bad disk block and a hand edit
+with a comma missing, and also a file that is valid JSON but not the right shape
+at all: a list or a bare number where the settings object belongs used to crash
+the miner on every start, which under `restart: unless-stopped` is a restart
+loop that preserves nothing and reports nothing. All of them now take the same
+route. The unreadable file is moved aside to `settings.json.corrupt` next to it,
+and the log says so:
 
 ```text
 Corrupt JSON in data/settings.json: <reason>. The unreadable file has been kept
@@ -215,7 +247,9 @@ and `GET /api/health/mining` answers `"ok":false` for exactly that reason. Your
 old list is still there in `settings.json.corrupt`: open it in a text editor,
 copy the `games_to_watch` entries back in from the Settings tab, then delete the
 file. A second corruption does not overwrite the first one, it becomes
-`settings.json.corrupt.1`, then `.2`, and so on.
+`settings.json.corrupt.1`, then `.2`, and so on. Preserved copies older than
+thirty days are eventually cleaned up, except the oldest one, which is kept
+whatever its age because it is the copy most likely to hold your real settings.
 
 The other line worth recognising is:
 
@@ -228,7 +262,22 @@ Restoring the stored list.
 Something tried to save an empty watch list while a non-empty one was on disk
 and no deliberate "clear all" was behind it. The stored list is put back both in
 memory and on disk, and mining carries on. Emptying the list on purpose from the
-dashboard is unaffected.
+dashboard is unaffected. There is a matching line for the mining benefits,
+`Refused to save a mining-benefits selection with every benefit type disabled
+over the stored ...`, which works the same way.
+
+One more line comes from upgrading or downgrading rather than from damage:
+
+```text
+Unknown keys in stored JSON, discarded: data/settings.json:some_old_setting.
+This version has no setting by those names, so whatever they held is gone -
+recover it from a backup if it mattered.
+```
+
+That is a setting this version does not have being dropped from your file. It
+used to happen in silence. Your own per-channel data is never dropped this way:
+settings that hold a free-form map, such as the per-channel betting strategies,
+are left exactly as you wrote them.
 
 ## Health and monitoring
 
@@ -249,19 +298,46 @@ stays green through the whole outage it was installed to catch.
 {
   "ok": false,
   "watchlist_empty": true,
+  "benefits_disabled": false,
   "games_to_watch_count": 0,
   "wanted_games_count": 0,
   "state": "idle",
   "mining": false,
-  "login": "yourtwitchname"
+  "watch_stalled": false,
+  "last_watch_age_seconds": null,
+  "uptime_seconds": 42,
+  "login": "yourtwitchname",
+  "login_pending": false
 }
 ```
 
-`ok` is false whenever the watch list is empty, the miner has not finished
-starting up, or the probe could not read part of its own state. That is the
-field to alert on: point an uptime monitor at the endpoint, have it
-keyword-match the literal `"ok":false`, and invert the match so a hit counts as
-down.
+`ok` is false whenever there is nothing to mine, nobody is logged in, the miner
+has stopped making progress, it has not finished starting up, or the probe could
+not read part of its own state. That is the field to alert on: point an uptime
+monitor at the endpoint, have it keyword-match the literal `"ok":false`, and
+invert the match so a hit counts as down.
+
+Two of those causes are about the miner being stuck rather than misconfigured.
+`login` is null and `login_pending` is true while the miner is waiting for
+somebody to approve a device code at twitch.tv/activate: it will sit there
+indefinitely, having never started watching anything, so it counts as not ok.
+`watch_stalled` is true when the miner has games it wants, is not deliberately
+paused, and has not successfully sent a watch tick for several minutes;
+`last_watch_age_seconds` is how long it has been, or null if it has not managed
+one yet this run. `uptime_seconds` is there so a monitor can tell a genuine
+stall from a process that only just started.
+
+An account with games configured and no active campaign right now is **not** an
+error. That is the ordinary state of a single-game account between campaigns,
+sometimes for days, and it reports `ok:true` with `wanted_games_count: 0`. A
+probe that cried wolf on it would train you to ignore the alert, which is worse
+than the gap it would close.
+
+"Nothing to mine" has two causes and they need different fixes, so they are
+reported separately. `watchlist_empty` means no game is on the watch list.
+`benefits_disabled` means no benefit type is enabled under "Mining benefits" in
+the Settings tab, which makes every drop unwanted and stops mining just as
+completely, with every game still listed as if nothing were wrong.
 
 Note the missing space. The sample above is pretty-printed for reading, but the
 response goes out minified, so the bytes on the wire are
@@ -301,6 +377,13 @@ fire on the normal gaps between channel switches.
 - The Docker image runs as UID 1000. On the first start after upgrading from
   a root-based image, the entrypoint re-chowns `./data` and `./logs`;
   `data/cookies.jar` (your Twitch session) survives the upgrade.
+- `data/cookies.jar` holds the Twitch auth token and is written user-only
+  (`0600`). The mode is set on the temporary file before the token is written to
+  it, so the token is never briefly readable by other users on the host, and a
+  jar left loose by an older version is tightened the next time it is saved.
+  The jar is also written atomically, so a container killed mid-write keeps the
+  previous session instead of coming up logged out; a jar that cannot be read is
+  reported and the miner asks you to log in again.
 - Discord bot secrets belong in `discord_bot/.env` (gitignored), never in the
   repository.
 

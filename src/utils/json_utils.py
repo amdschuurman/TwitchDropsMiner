@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import glob
 import json
 import logging
 import os
@@ -33,12 +34,46 @@ _MAX_QUARANTINE_SLOTS = 100
 # A save takes milliseconds, so a temp file older than this belongs to a process
 # that died before its rename - never to a save currently in flight.
 _STALE_TEMP_AGE = 3600.0
+# How long a quarantined file is kept before the reaper may take it. Far longer
+# than a temp file's hour, because a quarantine is EVIDENCE: it can be the only
+# surviving copy of the operator's settings, and someone who was away for a
+# fortnight must still find it waiting. Thirty days is past the point where the
+# values in it are worth recovering by hand.
+_STALE_QUARANTINE_AGE = 30 * 24 * 3600.0
+# ...and this many of the OLDEST quarantines survive the reaper no matter how old
+# they get. :func:`quarantine_corrupt` already refuses to clobber an earlier
+# quarantine because the earliest copy is the one most likely to hold real
+# pre-corruption data; the reaper follows the same priority, so the operator is
+# never left with no evidence at all.
+_KEPT_QUARANTINES = 1
 # The mode json_save guarantees on the live file (mkstemp creates 0o600 whatever
 # the umask, and os.replace carries that onto the target) and quarantine_corrupt
 # restores on the copy it preserves. These files can hold a proxy URL with
 # credentials in it and the discord_webhook_* URLs, so other users on the host
 # must not be able to read them.
 _PRIVATE_FILE_MODE = 0o600
+
+
+class _UnusableJSONError(ValueError):
+    """The bytes parsed as JSON, but they are not the structure we wrote.
+
+    A sibling of ``json.JSONDecodeError`` rather than a separate concept, and a
+    ``ValueError`` for the same reason that one is: "this file is not what it is
+    supposed to be" has exactly one right answer in :func:`json_load`, and both
+    ways of being wrong deserve it. Two things raise it, both of them facts about
+    the FILE:
+
+    - the top-level value is not an object (``[]``, ``42``, ``"hello"``,
+      ``null``, or a ``__type`` wrapper that decoded to a set);
+    - a ``__type`` wrapper's payload could not be handed to its
+      :data:`SERIALIZE_ENV` constructor (``{"__type": "set", "data": 5}``).
+
+    Deliberately its own class, and deliberately raised only at those two points:
+    catching the underlying ``AttributeError``/``TypeError``/``KeyError`` where
+    they surfaced would also have swallowed the same exception types coming out
+    of a genuine bug elsewhere in the load, which is how a data problem turns
+    into an invisible logic problem.
+    """
 
 
 # Serialization environment - maps type names to deserialization functions
@@ -90,21 +125,67 @@ def _serialize(obj: Any) -> Any:
     }
 
 
-def _remove_missing(obj: JsonType) -> JsonType:
+def _reject_missing_in_list(values: list[Any], label: str) -> None:
+    """
+    Refuse a list holding an unrecognized ``__type`` wrapper, and clean the rest.
+
+    The sibling of :func:`_remove_missing` for the one container it cannot treat
+    the same way. Dropping a key whose value did not deserialize is safe because
+    :func:`merge_json` puts the template's default back, so the shape survives and
+    nothing quietly shrinks. A LIST has no per-element template: dropping an
+    element would shorten ``games_to_watch`` by one game with nothing on the
+    console and nothing in the log - the exact silent loss this module now exists
+    to refuse.
+
+    Leaving the sentinel alone was worse still, and is what actually happened:
+    ``_remove_missing`` only ever walked dicts, so ``{"games_to_watch": ["Rust",
+    {"__type": "Decimal", "data": "1"}]}`` loaded with a bare sentinel object
+    sitting in the watch list, and the next :func:`json_save` hit it in
+    :func:`_serialize` and raised ``TypeError`` - on that save and on every save
+    after it. Settings could never be persisted again, and the miner was left
+    trying to match a sentinel against channel game names.
+
+    So the file goes down the corrupt route instead: it is not the structure this
+    version writes (only a version that registered a type in
+    :data:`SERIALIZE_ENV` which this one does not could produce it), the bytes are
+    worth preserving, and the operator gets told. Recognized wrappers inside lists
+    are untouched - a list of datetimes round-trips exactly as before.
+    """
+    for index, value in enumerate(values):
+        if value is _MISSING:
+            raise _UnusableJSONError(
+                f"the list at {label}[{index}] holds a __type wrapper this version "
+                "does not recognize"
+            )
+        elif isinstance(value, dict):
+            _remove_missing(value, label=f"{label}[{index}].")
+        elif isinstance(value, list):
+            _reject_missing_in_list(value, f"{label}[{index}]")
+
+
+def _remove_missing(obj: JsonType, *, label: str = "") -> JsonType:
     """
     Remove _MISSING sentinel values from a dictionary recursively.
 
     This modifies obj in place, but returns it for convenience.
     Used during deserialization to clean up unrecognized types.
+
+    Guarantees that no sentinel survives anywhere below ``obj`` - inside a nested
+    list, or inside a dict inside one - because :func:`json_save` cannot
+    serialize one and the failure surfaces at the next save rather than here.
+    Lists are handled by :func:`_reject_missing_in_list`, which explains why they
+    refuse rather than prune. ``label`` names the position for that message.
     """
     for key, value in obj.copy().items():
         if value is _MISSING:
             del obj[key]
         elif isinstance(value, dict):
-            _remove_missing(value)
+            _remove_missing(value, label=f"{label}{key}.")
             if not value:
                 # the dict is empty now, so remove it's key entirely
                 del obj[key]
+        elif isinstance(value, list):
+            _reject_missing_in_list(value, f"{label}{key}")
     return obj
 
 
@@ -114,11 +195,31 @@ def _deserialize(obj: JsonType) -> Any:
 
     Reconstructs objects from serialized format using SERIALIZE_ENV.
     Returns _MISSING sentinel for unrecognized types (to be cleaned up later).
+
+    A wrapper whose type IS recognized but whose payload the constructor rejects
+    is a corrupt file, not an unknown type, so it raises :class:`_UnusableJSONError`
+    instead of degrading to ``_MISSING``: ``{"__type": "set", "data": 5}`` used to
+    raise ``TypeError`` and ``{"__type": "set"}`` a ``KeyError`` straight out of
+    :func:`json_load`, past its handler, up to ``sys.exit(4)`` - a container
+    restart loop, with the file left in place to do it again on the next boot.
+    Every exception the constructor can raise is about the stored payload (the
+    call itself is fixed), which is why the catch here is broad; the raise is
+    narrow, so nothing else in the load is affected.
+
+    The message names the wrapper's TYPE and never its data: a ``proxy`` or
+    ``discord_webhook_*`` URL can be stored inside one, and this text reaches
+    logs/TDM.log.
     """
     if "__type" in obj:
         obj_type = obj["__type"]
         if obj_type in SERIALIZE_ENV:
-            return SERIALIZE_ENV[obj_type](obj["data"])
+            try:
+                return SERIALIZE_ENV[obj_type](obj["data"])
+            except Exception as exc:
+                raise _UnusableJSONError(
+                    f"a stored {obj_type!r} value could not be decoded "
+                    f"({type(exc).__name__})"
+                ) from exc
         else:
             return _MISSING
     return obj
@@ -130,18 +231,41 @@ def merge_json(obj: JsonType, template: Mapping[Any, Any], *, label: str = "") -
 
     NOTE: This modifies object in place.
 
-    - Removes keys not present in template
+    - An EMPTY template is an open map and is left completely alone (see below)
+    - Removes keys not present in a non-empty template, reporting it at ERROR
     - Overwrites values with wrong type from template, reporting it at ERROR
     - Recursively merges nested dictionaries
     - Adds missing keys from template
 
-    The type overwrite is the destructive one, so it is the one that is logged:
-    a hand-edited ``"games_to_watch": "War Thunder"`` (a string where a list
-    belongs) used to become ``[]`` right here, with nothing on the console and
-    nothing in the log - and an empty watch list means the miner mines nothing.
-    The message names the key and both types but deliberately NOT the value: a
-    wrong-typed ``proxy`` or ``discord_webhook_*`` would put credentials into
-    logs/TDM.log, and the key is already enough to find the offending line.
+    A template says two different things depending on whether it has any keys,
+    and treating both the same destroyed real data:
+
+    - A NON-EMPTY template is a SCHEMA. It enumerates every key that may exist,
+      so a stored key it does not list is a setting this version removed, and
+      pruning it is right.
+    - An EMPTY template is an OPEN MAP. It enumerates nothing, so it cannot
+      possibly be an authority on what is unknown - every stored key is the
+      user's own DATA. ``channel_strategies`` is one (``{}`` in
+      ``default_settings``, filled with one entry per channel the user chose a
+      betting strategy for), and the old rule deleted every one of those keys on
+      load, then let the next save persist ``{}``: per-channel strategies simply
+      vanished, silently, exactly like the empty watch list did. So an empty
+      template short-circuits - nothing to prune against, no types to check, no
+      keys to add.
+
+    Both destructive branches are logged at ERROR now. Deleting a key discards
+    whatever the operator had put there just as surely as overwriting a
+    wrong-typed one does, and the previous silence meant a downgrade could drop a
+    setting with no trace at all. The removals are reported as ONE line per
+    object rather than one per key, so a legacy file that is a few settings
+    behind produces a line, not a wall.
+
+    Both messages name keys and types but deliberately NOT values: a wrong-typed
+    or newly-unknown ``proxy`` or ``discord_webhook_*`` would put credentials
+    into logs/TDM.log, and the key is already enough to find the offending line.
+    Keys are safe to print here precisely because open maps are never pruned -
+    every key this function can delete comes from a schema, so it is the name of
+    a setting, never something the user typed.
 
     Args:
         obj: The loaded JSON object, modified in place
@@ -151,10 +275,17 @@ def merge_json(obj: JsonType, template: Mapping[Any, Any], *, label: str = "") -
             (``data/settings.json:``) and the recursion appends the key it
             descends into (``inventory_filters.``).
     """
+    if not template:
+        # An open map: the stored keys are data, and there is nothing to merge
+        # them against. Leaving early is the whole behaviour.
+        return
+    discarded: list[str] = []
     for k, v in list(obj.items()):
         if k not in template:
-            # unknown key: overwrite from template
+            # unknown key: this template lists every key there is, so the stored
+            # one belongs to no setting and its value cannot be kept
             del obj[k]
+            discarded.append(f"{label}{k}")
         elif type(v) is not type(template[k]):
             # types don't match: overwrite from template
             logger.error(
@@ -166,10 +297,90 @@ def merge_json(obj: JsonType, template: Mapping[Any, Any], *, label: str = "") -
         elif isinstance(v, dict):
             assert isinstance(template[k], dict)
             merge_json(v, template[k], label=f"{label}{k}.")
+    if discarded:
+        logger.error(
+            f"Unknown keys in stored JSON, discarded: {', '.join(discarded)}. This "
+            "version has no setting by those names, so whatever they held is gone - "
+            "recover it from a backup if it mattered."
+        )
     # ensure the object is not missing any keys
     for k in template:
         if k not in obj:
             obj[k] = template[k]
+
+
+def _sweep_stale(path: Path, pattern: str, max_age: float, *, keep_oldest: int = 0) -> None:
+    """
+    Delete this target's own leftovers matching ``pattern``, oldest ones spared.
+
+    The one reaper behind both :func:`_sweep_stale_temps` and
+    :func:`_sweep_stale_quarantines`, because the rules they need are the same
+    three:
+
+    - Scoped to ONE target. ``pattern`` is built around ``path.name`` (escaped,
+      so a target whose name contains ``*``, ``?`` or ``[`` cannot widen the
+      glob into another target's files), and never matches the live file itself.
+    - Age-based, off mtime, so a file another process may still be about to use
+      is never taken. Both callers guarantee mtime means "when this file stopped
+      being live" - ``mkstemp`` has just created the temp, and
+      :func:`quarantine_corrupt` re-stamps the copy it preserves.
+    - Every failure suppressed, at both levels: an unreadable directory ends the
+      sweep, an unreadable or undeletable entry skips just that entry. Reaping
+      garbage must never be the reason a save or a quarantine fails.
+
+    ``keep_oldest`` spares that many of the oldest matches unconditionally, for
+    the caller whose leftovers are evidence rather than litter.
+    """
+    cutoff = time.time() - max_age
+    found: list[tuple[float, Path]] = []
+    with contextlib.suppress(OSError):
+        for candidate in path.parent.glob(pattern):
+            with contextlib.suppress(OSError):
+                found.append((candidate.stat().st_mtime, candidate))
+    # Name breaks a tie, so which files are spared never depends on the order the
+    # directory happens to enumerate in: a burst of corruption inside one clock
+    # tick gives every quarantine the same mtime, and the unnumbered
+    # ``<name>.corrupt`` - the FIRST one ever taken - sorts ahead of every
+    # ``.corrupt.N`` under a plain string sort, which is exactly the one to keep.
+    found.sort(key=lambda item: (item[0], item[1].name))
+    for mtime, candidate in found[keep_oldest:]:
+        if mtime < cutoff:
+            with contextlib.suppress(OSError):
+                candidate.unlink()
+
+
+def _sweep_stale_quarantines(path: Path) -> None:
+    """
+    Delete this target's long-expired ``.corrupt`` files (see :func:`quarantine_corrupt`).
+
+    Quarantining preserves the bytes and nothing ever collected them again: a
+    filesystem that corrupts settings.json on every boot fills the data directory
+    with ``settings.json.corrupt``, ``.corrupt.1`` ... ``.corrupt.99`` and then an
+    unbounded run of timestamped names, and once the numbered slots are gone
+    every later quarantine costs 100 failed ``stat`` calls as well.
+
+    Deliberately far more timid than the temp sweep, because these files are the
+    opposite of garbage - one of them may be the only surviving copy of the
+    operator's settings:
+
+    - nothing is touched until it is ``_STALE_QUARANTINE_AGE`` old (thirty days,
+      not the temps' hour);
+    - the oldest ``_KEPT_QUARANTINES`` survive whatever their age, so a directory
+      that has been collecting these for a year still hands the operator the
+      copy most likely to hold real pre-corruption data - the same "an earlier
+      quarantine outranks a later one" rule :func:`quarantine_corrupt` follows
+      when it refuses to clobber one.
+
+    The pattern cannot match the live file (it requires the ``.corrupt`` suffix)
+    nor a temp file (those are dot-prefixed), and cannot reach another target's
+    quarantines (they carry that target's name).
+    """
+    _sweep_stale(
+        path,
+        f"{glob.escape(path.name)}{_CORRUPT_SUFFIX}*",
+        _STALE_QUARANTINE_AGE,
+        keep_oldest=_KEPT_QUARANTINES,
+    )
 
 
 def quarantine_corrupt(path: Path) -> Path | None:
@@ -197,6 +408,14 @@ def quarantine_corrupt(path: Path) -> Path | None:
     ``discord_webhook_*`` URLs. Best-effort like the rest of this module: a mode
     that cannot be changed must not turn preserving the evidence into losing it.
 
+    The preserved copy's mtime is re-stamped to NOW, which is what makes
+    :func:`_sweep_stale_quarantines` safe: ``os.replace`` carries the original
+    mtime across, so a settings.json last saved months before it was corrupted
+    would land here already looking ancient and be reaped on the spot. The
+    stamped time answers the only question the reaper asks - "when did this file
+    stop being live?" - and the original mtime is not worth keeping at the price
+    of deleting the evidence early.
+
     Returns ``None`` when the file could not be moved (a read-only data
     directory, for instance); the corrupt file is then left exactly where it is
     rather than deleted, and the caller still logs the failure.
@@ -215,6 +434,11 @@ def quarantine_corrupt(path: Path) -> Path | None:
             return None
         with contextlib.suppress(OSError):
             os.chmod(target, _PRIVATE_FILE_MODE)
+        with contextlib.suppress(OSError):
+            os.utime(target, None)
+        # Only after this one has landed, so a reaper failure can never be what
+        # loses the file it was called to make room for.
+        _sweep_stale_quarantines(path)
         return target
     return None
 
@@ -240,6 +464,18 @@ def json_load(
     Callers that pass ``quarantine=True`` are accepting a fresh-defaults start in
     exchange for the preserved evidence.
 
+    "Unparseable" is meant structurally, not just syntactically. A file whose
+    JSON is perfectly well-formed but is not the OBJECT this function returns -
+    ``[]``, ``42``, ``"hello"``, ``null`` - used to reach ``_remove_missing`` and
+    die there with ``'list' object has no attribute 'items'``, and a recognized
+    ``__type`` wrapper holding a payload its constructor rejects died the same
+    way with a ``TypeError``. Neither was caught anywhere: for settings.json that
+    is ``sys.exit(4)`` on every boot and, under ``restart: unless-stopped``, a
+    restart loop that quarantines nothing and tells the operator nothing. Such a
+    file is corrupt in exactly the sense this function already knows how to
+    handle, so it now takes the same route - defaults, quarantine when asked for,
+    ERROR - and the container comes up.
+
     Args:
         path: Path to JSON file
         defaults: Default values to use if file doesn't exist or merge is enabled
@@ -254,7 +490,18 @@ def json_load(
     if path.exists():
         try:
             with open(path, encoding="utf8") as file:
-                combined: JsonType = _remove_missing(json.load(file, object_hook=_deserialize))
+                loaded = json.load(file, object_hook=_deserialize)
+            if not isinstance(loaded, dict):
+                # Checked here rather than left to blow up in _remove_missing,
+                # so that "the file is not an object" is a fact about the file
+                # and not an AttributeError indistinguishable from a bug.
+                found = (
+                    "a __type wrapper this version does not recognize"
+                    if loaded is _MISSING
+                    else f"of type {type(loaded).__name__!r}"
+                )
+                raise _UnusableJSONError(f"the top-level value is {found}, not an object")
+            combined: JsonType = _remove_missing(loaded)
         except ValueError as e:
             # ValueError, not JSONDecodeError: a file corrupted at the byte level
             # (a bad block, a partially-written page) raises UnicodeDecodeError
@@ -262,7 +509,8 @@ def json_load(
             # a crash - for settings.json that meant exit code 4 and, under
             # `restart: unless-stopped`, a container restart loop. Both are the
             # same event, "these bytes are not the JSON we wrote", so both are
-            # handled the same way here.
+            # handled the same way here - as is _UnusableJSONError, a ValueError
+            # for precisely that reason.
             if quarantine:
                 preserved = quarantine_corrupt(path)
                 if preserved is not None:
@@ -303,13 +551,12 @@ def _sweep_stale_temps(path: Path) -> None:
     temp file is seconds old - is never robbed of the file it is about to rename.
     Every failure is ignored: reaping garbage must never turn a successful save
     into a failed one.
+
+    No ``keep_oldest``: unlike a quarantine, an abandoned temp holds a payload
+    that was superseded by the very save that replaced it, so there is nothing
+    here worth sparing.
     """
-    cutoff = time.time() - _STALE_TEMP_AGE
-    with contextlib.suppress(OSError):
-        for temp in path.parent.glob(f".{path.name}.*{_TEMP_SUFFIX}"):
-            with contextlib.suppress(OSError):
-                if temp.stat().st_mtime < cutoff:
-                    temp.unlink()
+    _sweep_stale(path, f".{glob.escape(path.name)}.*{_TEMP_SUFFIX}", _STALE_TEMP_AGE)
 
 
 def json_save(path: Path, contents: Mapping[Any, Any], *, sort: bool = False) -> None:

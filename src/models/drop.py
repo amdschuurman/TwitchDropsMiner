@@ -216,7 +216,13 @@ class TimedDrop(BaseDrop):
         self_data: JsonType = data.get("self") or {}
         api_minutes: int = self_data.get("currentMinutesWatched") or 0
         self.required_minutes: int = data["requiredMinutesWatched"]
-        self.real_current_minutes: int = drop_minutes_cache.get(self.id, api_minutes)
+        # Bounded by the requirement: a cached figure above it cannot have come
+        # from _update_real_minutes (which clamps), and for a badge/emote drop it
+        # would make the is_claimed inference below fire on a drop that is not
+        # finished - dropping the game out of wanted_games with nothing logged.
+        self.real_current_minutes: int = drop_minutes_cache.get(
+            self.id, api_minutes, maximum=self.required_minutes
+        )
         self.extra_current_minutes: int = 0
         if self.is_claimed:
             # claimed drops may report inconsistent current minutes, so we need to overwrite them

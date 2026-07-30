@@ -27,6 +27,14 @@ const state = {
     campaigns: {},
     settings: {},
     settingsLoaded: false,  // guards saveSettings() from firing before real settings arrive
+    // The games_to_watch the SERVER last told us it has stored. Refreshed only where a
+    // server payload arrives (initial_state, the settings_updated broadcast, and a
+    // settings write's own response) — never from a local edit. Every watch-list gesture
+    // mutates state.settings.games_to_watch, so this is the only value left that still
+    // describes what is actually on disk, and saveSettings() sends it as
+    // expected_games_to_watch when clearing the list so the server can refuse a wipe
+    // driven by a tab that loaded before the list grew.
+    serverGamesToWatch: [],
     currentDrop: null,
     countdownTimer: null,  // Track the active countdown timer
     translations: {},  // Store current translations
@@ -1661,9 +1669,17 @@ function renderInventory() {
 
         farmToggle.addEventListener('click', (e) => {
             e.stopPropagation();
+            // Read the watch list at CLICK time, not render time. The watchListEmpty
+            // computed above decides only how this button LOOKS; the card outlives that
+            // moment, and every gesture that changes the list without re-rendering the
+            // inventory (removeGameFromWatch, toggleGameWatch, deselectAllGames — they
+            // re-render the Settings tab only) leaves the captured flag lying. Branching
+            // on a stale "the list was empty" here would take the no-filter path and
+            // overwrite a list somebody has since filled with every-game-but-this-one.
             let current = [...(state.settings.games_to_watch || [])];
+            const currentlyEmpty = current.length === 0;
             const existingIdx = current.findIndex(g => g.toLowerCase() === gameName.toLowerCase());
-            if (watchListEmpty) {
+            if (currentlyEmpty) {
                 // No filter active — "skip" this game means add all others to the list
                 const allGames = [...new Set(Object.values(state.campaigns).map(c => c.game_name))];
                 current = allGames.filter(g => g.toLowerCase() !== gameName.toLowerCase());
@@ -1839,6 +1855,13 @@ function updateLoginStatus(data) {
 function updateSettingsUI(settings) {
     state.settings = settings;
     state.settingsLoaded = true;
+    // This function is the ONLY place a server-sent settings payload lands (the
+    // initial_state handler and the settings_updated broadcast both funnel here), so it
+    // is where the server-believed watch list is snapshotted. Copy, never alias: the
+    // gestures below splice/push state.settings.games_to_watch in place, which would
+    // rewrite this snapshot too and leave the concurrency check comparing the locally
+    // edited list against itself.
+    state.serverGamesToWatch = [...(settings.games_to_watch || [])];
     document.getElementById('dark-mode').checked = settings.dark_mode ?? false;
     document.getElementById('connection-quality').value = settings.connection_quality ?? 1;
     document.getElementById('minimum-refresh-interval').value = settings.minimum_refresh_interval_minutes ?? 30;
@@ -2785,6 +2808,70 @@ function addChannelOverride() {
 }
 
 /**
+ * Reconcile this tab with the server's answer to a settings write.
+ *
+ * Two jobs, both about the single write that can stop the miner — clearing
+ * games_to_watch:
+ *
+ * 1. Refresh state.serverGamesToWatch from the authoritative list the response carries.
+ *    The settings_updated broadcast does this too, but it is emitted as a background
+ *    task and lands later; refreshing here closes the window in which a second gesture
+ *    would send an already-outdated expected_games_to_watch and get refused for it.
+ * 2. Say out loud when a clear was refused. The server rejects a clear whose
+ *    expected_games_to_watch no longer matches what it has stored, then re-broadcasts the
+ *    stored settings, so every view just snaps back with no explanation. Name the reason
+ *    and resync, so the tab never sits on an empty list the server does not have.
+ *
+ * Written to survive either refusal shape: an OK response whose returned list still has
+ * games in it, or an HTTP error carrying a detail string.
+ *
+ * @param {Response} response - Response to the POST /api/settings write.
+ * @param {boolean} clearingWatchList - Whether that write asked to empty games_to_watch.
+ * @returns {Promise<boolean>} False when the write failed or the clear was refused.
+ */
+async function reconcileSettingsSave(response, clearingWatchList) {
+    let body = null;
+    try {
+        body = await response.json();
+    } catch {
+        body = null;  // empty or non-JSON body — the status code alone decides below
+    }
+    const stored = (body && body.settings && Array.isArray(body.settings.games_to_watch))
+        ? body.settings.games_to_watch
+        : null;
+    if (stored) state.serverGamesToWatch = [...stored];
+
+    if (!clearingWatchList) {
+        if (!response.ok) console.error('Failed to save settings: HTTP ' + response.status);
+        return response.ok;
+    }
+    // The clear landed only if the server came back OK with a list that is actually
+    // empty now. A server that echoes no settings at all gets the benefit of the doubt.
+    if (response.ok && (!stored || stored.length === 0)) return true;
+
+    const detail = (body && typeof body.detail === 'string' && body.detail) ? body.detail : '';
+    const kept = (stored && stored.length) ? ` Still watching: ${stored.join(', ')}.` : '';
+    addConsoleLine(
+        `Watch list not cleared: it changed elsewhere since this page loaded.${kept}` +
+        (detail ? ` (${detail})` : '')
+    );
+
+    if (body && body.settings) {
+        // Authoritative post-write state, same shape as the settings_updated broadcast.
+        updateSettingsUI(body.settings);
+    } else {
+        // Nothing authoritative came back (error response, and an error path never
+        // broadcasts). Never leave this tab believing the list is empty while the miner
+        // still has games — put the last server-sent list back.
+        state.settings.games_to_watch = [...state.serverGamesToWatch];
+        renderGamesToWatch();
+        renderChannels();
+        renderInventory();
+    }
+    return false;
+}
+
+/**
  * @param {{allowEmptyGames?: boolean}} [options] - allowEmptyGames marks this one request
  *   as a deliberate user gesture that may leave games_to_watch empty (e.g. "Deselect All").
  */
@@ -2813,6 +2900,38 @@ async function saveSettings(options = {}) {
     const gamesToWatch = state.settings.games_to_watch || [];
     const allowEmptyGames = options.allowEmptyGames === true;
 
+    // Optimistic-concurrency guard for the one write that can stop the miner. The
+    // per-game removal gestures all declare allowEmptyGames, so a tab that loaded when
+    // the stored list was ['A'] would happily wipe a list that has since become
+    // ['A','B','C'] — the intent flag says "emptying is deliberate", not "emptying THIS
+    // list is deliberate". So a clear also carries the list this tab believes is stored,
+    // and the server refuses the write when that no longer matches reality.
+    const clearingWatchList = allowEmptyGames && gamesToWatch.length === 0;
+
+    // Every mining-benefit type turned off is the quiet twin of an empty watch list:
+    // Benefit.is_wanted is fail-closed, so no drop is wanted, no game is selected and
+    // mining stops — while the Settings tab still lists every game. The server therefore
+    // refuses that write unless the same request declares the intent, exactly as it does
+    // for an empty games_to_watch.
+    //
+    // The dict and the flag have to come from ONE read of the DOM, or they can disagree.
+    // `?.checked` is undefined for a control that has not rendered and JSON.stringify
+    // then DROPS that key, so a save fired before the Settings tab exists reads four
+    // undefineds — which means "this request says nothing about benefits", NOT "the user
+    // turned everything off". Declaring intent on that would ask the server to disable
+    // types nobody touched. So only reads that are actually present go into the dict, and
+    // the flag rides along only when every control exists and every one of them is off.
+    const benefitReads = {
+        "DIRECT_ENTITLEMENT": document.getElementById('mining-benefit-item')?.checked,
+        "BADGE": document.getElementById('mining-benefit-badge')?.checked,
+        "EMOTE": document.getElementById('mining-benefit-emote')?.checked,
+        "UNKNOWN": document.getElementById('mining-benefit-unknown')?.checked
+    };
+    const presentBenefits = Object.entries(benefitReads).filter(([, on]) => typeof on === 'boolean');
+    const miningBenefits = Object.fromEntries(presentBenefits);
+    const disablingAllBenefits = presentBenefits.length === Object.keys(benefitReads).length
+        && presentBenefits.every(([, on]) => on === false);
+
     const settings = {
         dark_mode: document.getElementById('dark-mode').checked,
         ...(language ? { language } : {}),
@@ -2821,13 +2940,14 @@ async function saveSettings(options = {}) {
         proxy: state.settings.proxy || '',
         ...(gamesToWatch.length > 0 || allowEmptyGames ? { games_to_watch: gamesToWatch } : {}),
         ...(allowEmptyGames ? { allow_empty_games_to_watch: true } : {}),
+        ...(clearingWatchList ? { expected_games_to_watch: state.serverGamesToWatch } : {}),
         inventory_filters: getInventoryFilters(),
-        mining_benefits: {
-            "DIRECT_ENTITLEMENT": document.getElementById('mining-benefit-item')?.checked,
-            "BADGE": document.getElementById('mining-benefit-badge')?.checked,
-            "EMOTE": document.getElementById('mining-benefit-emote')?.checked,
-            "UNKNOWN": document.getElementById('mining-benefit-unknown')?.checked
-        },
+        // Dropped entirely when no benefit control rendered. An absent key means "not
+        // supplied" server-side and is left alone; an empty dict instead re-submits the
+        // stored selection, so a user who has deliberately turned everything off would
+        // have every unrelated save refused for an intent this request never expressed.
+        ...(presentBenefits.length > 0 ? { mining_benefits: miningBenefits } : {}),
+        ...(disablingAllBenefits ? { allow_empty_mining_benefits: true } : {}),
         discord_webhook_drops: document.getElementById('discord-webhook-drops')?.value || '',
         discord_webhook_points: document.getElementById('discord-webhook-points')?.value || '',
         discord_webhook_mentions: document.getElementById('discord-webhook-mentions')?.value || '',
@@ -2856,12 +2976,14 @@ async function saveSettings(options = {}) {
     };
 
     try {
-        await fetch(API_BASE + '/api/settings', {
+        const response = await fetch(API_BASE + '/api/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(settings)
         });
-        console.log('Settings saved automatically');
+        if (await reconcileSettingsSave(response, clearingWatchList)) {
+            console.log('Settings saved automatically');
+        }
     } catch (error) {
         console.error('Failed to save settings:', error);
     }

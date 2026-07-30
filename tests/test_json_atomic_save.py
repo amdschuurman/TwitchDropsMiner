@@ -25,13 +25,16 @@ import os
 import stat
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from yarl import URL
+
 from src.config.settings import default_settings
 from src.utils import json_utils
-from src.utils.json_utils import json_load, json_save, quarantine_corrupt
+from src.utils.json_utils import json_load, json_save, merge_json, quarantine_corrupt
 
 
 class _Interrupted(Exception):
@@ -367,8 +370,140 @@ class TestCorruptFileQuarantine(JsonSaveTestBase):
         self.assertEqual(stat.S_IMODE(preserved.stat().st_mode), 0o600)
 
 
+class TestStructurallyCorruptFilesAreHandled(JsonSaveTestBase):
+    """"Unparseable" has to mean structurally, not just syntactically.
+
+    ``json_load`` promises a dict. A file whose JSON is perfectly well-formed
+    but is not one - ``[]``, ``42``, ``"hello"``, ``null`` - used to sail past
+    the ``ValueError`` handler and die in ``_remove_missing`` with ``'list'
+    object has no attribute 'items'``. So did a recognized ``__type`` wrapper
+    holding a payload its constructor rejects, with a ``TypeError``. Neither was
+    caught anywhere: for settings.json that is ``sys.exit(4)`` on every boot,
+    and under ``restart: unless-stopped`` a restart loop that quarantines
+    nothing and tells the operator nothing - the container is down and the file
+    that put it there is still sitting where it was.
+
+    All of them are the same event as a truncated file ("these bytes are not the
+    JSON we wrote"), so they now take the same route: defaults, quarantine when
+    the caller asked for it, ERROR, and a process that comes up.
+    """
+
+    # Every shape that used to escape the handler. The names are what the
+    # failure looks like on disk, not what raised, because the point is that the
+    # caller no longer has to know which internal error each one produced.
+    UNUSABLE = {
+        "a top-level array": "[]",
+        "a top-level array with data": '["War Thunder", "Overwatch 2"]',
+        "a top-level string": '"hello"',
+        "a top-level number": "42",
+        "a top-level null": "null",
+        # A recognized wrapper whose payload the constructor rejects: set(5).
+        "a set built from a number": '{"__type": "set", "data": 5}',
+        # ...and the one the brief did not name: no "data" key at all, KeyError.
+        "a wrapper with no data key": '{"__type": "set"}',
+        # datetime.fromtimestamp(1e300) -> OverflowError, not a TypeError.
+        "a datetime out of range": '{"__type": "datetime", "data": 1e300}',
+        # Decodes fine, and produces a set where the object belongs.
+        "a top-level set": '{"__type": "set", "data": [1, 2]}',
+        # An unknown wrapper at the top level decodes to the _MISSING sentinel.
+        "a top-level unknown wrapper": '{"__type": "Decimal", "data": "1"}',
+        # A sentinel inside a LIST: dropping it would silently shorten the watch
+        # list, and leaving it made every later json_save raise TypeError.
+        "an unknown wrapper inside a list": (
+            '{"games_to_watch": ["Rust", {"__type": "Decimal", "data": "1"}]}'
+        ),
+        "an unknown wrapper nested deeper": (
+            '{"games_to_watch": [["Rust", {"__type": "Decimal", "data": "1"}]]}'
+        ),
+    }
+
+    def write(self, text: str) -> Path:
+        self.path.write_text(text, encoding="utf8")
+        return self.path
+
+    def test_every_unusable_shape_loads_defaults_and_is_quarantined(self):
+        for name, text in self.UNUSABLE.items():
+            with self.subTest(stored=name):
+                self.write(text)
+
+                with self.assertLogs("TwitchDrops", level="ERROR") as captured:
+                    loaded = json_load(self.path, default_settings, merge=True, quarantine=True)
+
+                preserved = self.dir / "settings.json.corrupt"
+                self.assertEqual(loaded["games_to_watch"], [])
+                self.assertEqual(preserved.read_text(encoding="utf8"), text)
+                self.assertFalse(self.path.exists())
+                self.assertIn(preserved.name, captured.output[0])
+                preserved.unlink()
+
+    def test_a_generic_caller_keeps_the_quiet_fallback(self):
+        for name, text in self.UNUSABLE.items():
+            with self.subTest(stored=name):
+                path = self.dir / "channel_points.json"
+                path.write_text(text, encoding="utf8")
+
+                with self.assertLogs("TwitchDrops", level="WARNING") as captured:
+                    loaded = json_load(path, {}, merge=False)
+
+                self.assertEqual(loaded, {})
+                self.assertEqual([r.levelname for r in captured.records], ["WARNING"])
+                # Derived data, so the file stays where it is and the next
+                # successful save heals it.
+                self.assertEqual(path.read_text(encoding="utf8"), text)
+
+    def test_the_stored_value_is_never_logged(self):
+        # The wrapper payload can be a proxy URL, and this text reaches
+        # logs/TDM.log. Naming the TYPE is enough to find the offending line.
+        self.write('{"__type": "URL", "data": {"user": "hunter2"}}')
+
+        with self.assertLogs("TwitchDrops", level="ERROR") as captured:
+            json_load(self.path, default_settings, merge=True, quarantine=True)
+
+        self.assertNotIn("hunter2", " ".join(captured.output))
+
+    def test_a_sentinel_in_a_list_can_no_longer_poison_every_later_save(self):
+        # The regression itself. _remove_missing only ever walked dicts, so the
+        # sentinel survived inside games_to_watch, and _serialize then raised
+        # TypeError on that save AND every save after it: settings could never
+        # be persisted again, and the miner was matching a bare object against
+        # channel game names.
+        self.write('{"games_to_watch": ["Rust", {"__type": "Decimal", "data": "1"}]}')
+
+        with self.assertLogs("TwitchDrops", level="ERROR"):
+            loaded = json_load(self.path, default_settings, merge=True, quarantine=True)
+
+        self.assertEqual(loaded["games_to_watch"], [])
+        json_save(self.path, loaded)  # used to raise TypeError(<object ...>)
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf8"))["games_to_watch"], [])
+
+    def test_a_dict_inside_a_list_is_cleaned_rather_than_refused(self):
+        # A list has no per-element template, so an element cannot be dropped
+        # without silently shortening it. A DICT inside one can lose a key,
+        # because merge_json puts the template's default back.
+        self.write('{"inventory_filters": [{"keep": 1, "gone": {"__type": "Decimal", "data": 1}}]}')
+
+        loaded = json_load(self.path, {}, merge=False)
+
+        self.assertEqual(loaded["inventory_filters"], [{"keep": 1}])
+
+    def test_valid_special_types_still_round_trip(self):
+        # The refusals must not have cost the feature they guard: sets,
+        # datetimes and URLs are real stored values, including inside lists.
+        payload = {
+            "a_set": {"one", "two"},
+            "a_time": datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc),
+            "a_url": URL("https://example.invalid/x"),
+            "in_a_list": [{"one"}, URL("https://example.invalid/y")],
+        }
+
+        json_save(self.path, payload)
+        loaded = json_load(self.path, {}, merge=False)
+
+        self.assertEqual(loaded, payload)
+
+
 class TestWrongTypesAreReported(JsonSaveTestBase):
-    """Replacing a wrong-typed value with the default is destructive - say so.
+    """Every branch of ``merge_json`` that destroys a stored value says so.
 
     ``merge_json`` guarantees the SHAPE of a stored file by overwriting any key
     whose type does not match the template. For ``games_to_watch`` that means a
@@ -377,10 +512,11 @@ class TestWrongTypesAreReported(JsonSaveTestBase):
     whole event left no trace on the console and none in the log, so the
     operator's only symptom was, once again, mining that stopped for no reason.
 
-    Only the destructive branch speaks. Deleting an unknown key and filling in a
-    missing one both leave the operator's own values alone, and an ERROR per
-    added default on every legacy settings.json is noise that teaches people to
-    scroll past the line that matters.
+    Deleting a key the template does not list is destructive in exactly the same
+    way - whatever the operator had put there is gone - so it is reported too,
+    as ONE line per object rather than one per key, which keeps a legacy file
+    that is a few settings behind down to a line instead of a wall. Filling in a
+    MISSING key stays silent: it adds a default and takes nothing away.
     """
 
     def load(self, stored: dict):
@@ -419,15 +555,121 @@ class TestWrongTypesAreReported(JsonSaveTestBase):
         self.assertIn("proxy", captured.output[0])
         self.assertNotIn("hunter2", " ".join(captured.output))
 
-    def test_a_merge_that_destroys_nothing_says_nothing(self):
-        stored = dict(default_settings) | {"a_setting_from_the_future": 1}
-        stored.pop("dark_mode")  # a legacy file, missing a key added since
+    def test_a_merge_that_only_adds_a_default_says_nothing(self):
+        # A legacy settings.json, missing a key added since. Nothing of the
+        # operator's is touched, and an ERROR per added default on every upgrade
+        # is noise that teaches people to scroll past the line that matters.
+        stored = dict(default_settings)
+        stored.pop("dark_mode")
 
         with self.assertNoLogs("TwitchDrops", level="DEBUG"):
             loaded = self.load(stored)
 
-        self.assertNotIn("a_setting_from_the_future", loaded)
         self.assertIs(loaded["dark_mode"], False)
+
+    def test_a_discarded_unknown_key_is_reported(self):
+        # A downgrade, or a rename: the key goes, and so does whatever it held.
+        # Silence here meant a setting could vanish with no trace at all.
+        stored = dict(default_settings) | {"a_setting_from_the_future": 1}
+
+        with self.assertLogs("TwitchDrops", level="ERROR") as captured:
+            loaded = self.load(stored)
+
+        self.assertNotIn("a_setting_from_the_future", loaded)
+        self.assertIn(f"{self.path}:a_setting_from_the_future", captured.output[0])
+
+    def test_several_discarded_keys_are_reported_on_one_line(self):
+        stored = dict(default_settings) | {"gone_one": 1, "gone_two": 2}
+
+        with self.assertLogs("TwitchDrops", level="ERROR") as captured:
+            self.load(stored)
+
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("gone_one", captured.output[0])
+        self.assertIn("gone_two", captured.output[0])
+
+    def test_a_discarded_keys_value_is_never_logged(self):
+        # The mirror of test_the_offending_value_is_never_logged: a proxy URL
+        # under a key this version no longer knows is still a credential.
+        secret = "http://user:hunter2@proxy.example:8080"
+        stored = dict(default_settings) | {"proxy_v2": secret}
+
+        with self.assertLogs("TwitchDrops", level="ERROR") as captured:
+            self.load(stored)
+
+        self.assertIn("proxy_v2", captured.output[0])
+        self.assertNotIn("hunter2", " ".join(captured.output))
+
+
+class TestOpenMapsAreNotPruned(JsonSaveTestBase):
+    """An empty template is an open map, and its keys are the operator's data.
+
+    A NON-EMPTY template is a schema: it enumerates every key that may exist, so
+    a stored key it does not list is a setting this version removed and pruning
+    it is right. An EMPTY template enumerates nothing, so it cannot be an
+    authority on what is unknown - and treating it as one deleted real data.
+
+    ``channel_strategies`` is ``{}`` in ``default_settings`` and holds one entry
+    per channel the operator picked a betting strategy for. Every load wiped all
+    of them, and the next save persisted ``{}``: the same silent loss as the
+    empty watch list, one setting over.
+    """
+
+    def load(self, stored: dict):
+        self.path.write_text(json.dumps(stored), encoding="utf8")
+        return json_load(self.path, default_settings, merge=True)
+
+    def test_an_open_maps_entries_survive_a_merge(self):
+        strategies = {"somechannel": "conservative", "otherchannel": "aggressive"}
+        stored = dict(default_settings) | {"channel_strategies": strategies}
+
+        with self.assertNoLogs("TwitchDrops", level="DEBUG"):
+            loaded = self.load(stored)
+
+        self.assertEqual(loaded["channel_strategies"], strategies)
+
+    def test_an_open_maps_entries_survive_a_save_and_load_round_trip(self):
+        # The loss was only cemented by the save that followed the load, so the
+        # round trip is the regression, not the load alone.
+        strategies = {"somechannel": "conservative"}
+        loaded = self.load(dict(default_settings) | {"channel_strategies": strategies})
+
+        json_save(self.path, loaded)
+
+        self.assertEqual(
+            json_load(self.path, default_settings, merge=True)["channel_strategies"],
+            strategies,
+        )
+
+    def test_an_open_map_does_not_have_value_types_enforced(self):
+        # There is no template entry to compare against, so there is no wrong
+        # type to report - only data this version does not interpret.
+        stored = dict(default_settings) | {"channel_strategies": {"somechannel": 7}}
+
+        with self.assertNoLogs("TwitchDrops", level="DEBUG"):
+            loaded = self.load(stored)
+
+        self.assertEqual(loaded["channel_strategies"], {"somechannel": 7})
+
+    def test_a_non_empty_template_still_prunes(self):
+        # The other half: mining_benefits IS a schema (a fixed enum of benefit
+        # types), so a key outside it is not data and must still go.
+        stored = dict(default_settings)
+        stored["mining_benefits"] = dict(stored["mining_benefits"]) | {"WEIRD": True}
+
+        with self.assertLogs("TwitchDrops", level="ERROR") as captured:
+            loaded = self.load(stored)
+
+        self.assertNotIn("WEIRD", loaded["mining_benefits"])
+        self.assertIn(f"{self.path}:mining_benefits.WEIRD", captured.output[0])
+
+    def test_merging_against_an_empty_template_is_a_no_op(self):
+        stored = {"anything": 1, "nested": {"deeper": 2}}
+        subject = dict(stored)
+
+        merge_json(subject, {}, label="x:")
+
+        self.assertEqual(subject, stored)
 
 
 class TestStaleTempSweep(JsonSaveTestBase):
@@ -482,6 +724,133 @@ class TestStaleTempSweep(JsonSaveTestBase):
             json.loads(self.path.read_text(encoding="utf8")),
             {"games_to_watch": ["Overwatch"]},
         )
+
+
+class TestStaleQuarantineSweep(JsonSaveTestBase):
+    """Quarantines are collected too, but timidly - they may be the last copy.
+
+    Nothing ever collected them: a filesystem that corrupts settings.json on
+    every boot fills the data directory with ``settings.json.corrupt``,
+    ``.corrupt.1`` ... ``.corrupt.99`` and then an unbounded run of timestamped
+    names, and once the numbered slots are gone every later quarantine costs a
+    hundred failed ``stat`` calls as well.
+
+    So the reaper is deliberately far more timid than the temp sweep: thirty
+    days rather than an hour, and the OLDEST one survives whatever its age,
+    because ``quarantine_corrupt`` already refuses to clobber an earlier
+    quarantine for the same reason - the earliest copy is the one most likely to
+    hold real pre-corruption data.
+
+    Age is never slept for: ``_STALE_QUARANTINE_AGE`` is patched down and mtimes
+    are set with ``os.utime``, which is honest because plain mtime IS the clock
+    the reaper reads, and ``quarantine_corrupt`` stamps it deliberately.
+    """
+
+    TRUNCATED = '{"games_to_watch": ["Overwatch", "Rust"'
+
+    def setUp(self):
+        super().setUp()
+        # Patched rather than slept through; see the class docstring.
+        patcher = patch.object(json_utils, "_STALE_QUARANTINE_AGE", 60.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def aged(self, name: str, *, age: float) -> Path:
+        path = self.dir / name
+        path.write_text(self.TRUNCATED, encoding="utf8")
+        stamp = time.time() - age
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def corrupt_now(self) -> Path:
+        self.path.write_text(self.TRUNCATED, encoding="utf8")
+        preserved = quarantine_corrupt(self.path)
+        assert preserved is not None
+        return preserved
+
+    def names(self) -> list[str]:
+        return sorted(p.name for p in self.dir.iterdir())
+
+    def old(self) -> float:
+        return json_utils._STALE_QUARANTINE_AGE * 2
+
+    def test_expired_quarantines_are_reaped_except_the_oldest(self):
+        # The oldest is the unnumbered .corrupt: the first one ever taken, and
+        # the one whose bytes pre-date every later corruption.
+        for index, name in enumerate(
+            ["settings.json.corrupt", "settings.json.corrupt.1", "settings.json.corrupt.2"]
+        ):
+            self.aged(name, age=self.old() + (10 - index))
+
+        self.corrupt_now()
+
+        self.assertEqual(
+            self.names(), ["settings.json.corrupt", "settings.json.corrupt.3"]
+        )
+
+    def test_a_lone_expired_quarantine_is_never_reaped(self):
+        # Reaping it would leave the operator with no evidence at all, which is
+        # strictly worse than one stale file.
+        self.aged("settings.json.corrupt", age=self.old())
+
+        preserved = self.corrupt_now()
+
+        self.assertTrue((self.dir / "settings.json.corrupt").exists())
+        self.assertEqual(preserved.name, "settings.json.corrupt.1")
+
+    def test_fresh_quarantines_are_left_alone(self):
+        for name in ("settings.json.corrupt", "settings.json.corrupt.1"):
+            self.aged(name, age=0)
+
+        self.corrupt_now()
+
+        self.assertEqual(len(self.names()), 3)
+
+    def test_another_targets_quarantine_is_left_alone(self):
+        self.aged("settings.json.corrupt", age=self.old())
+        self.aged("settings.json.corrupt.1", age=self.old())
+        other = self.aged("channel_points.json.corrupt", age=self.old())
+
+        self.corrupt_now()
+
+        self.assertTrue(other.exists())
+
+    def test_a_temp_file_is_not_reaped_by_the_quarantine_sweep(self):
+        # Different pattern, different age rule: the two sweeps must not reach
+        # into each other's files.
+        self.aged("settings.json.corrupt", age=self.old())
+        self.aged("settings.json.corrupt.1", age=self.old())
+        temp = self.aged(f".settings.json.abc123{json_utils._TEMP_SUFFIX}", age=0)
+
+        self.corrupt_now()
+
+        self.assertTrue(temp.exists())
+
+    def test_a_sweep_that_cannot_delete_still_returns_the_new_quarantine(self):
+        # Reaping is housekeeping; failing it must never be what loses the file
+        # the quarantine was called to preserve.
+        self.aged("settings.json.corrupt", age=self.old())
+        self.aged("settings.json.corrupt.1", age=self.old())
+        self.path.write_text(self.TRUNCATED, encoding="utf8")
+
+        with patch.object(Path, "unlink", side_effect=OSError("busy")):
+            preserved = quarantine_corrupt(self.path)
+
+        self.assertEqual(preserved, self.dir / "settings.json.corrupt.2")
+        self.assertEqual(preserved.read_text(encoding="utf8"), self.TRUNCATED)
+
+    def test_the_preserved_copys_mtime_is_stamped_to_now(self):
+        # Load-bearing: os.replace carries the ORIGINAL mtime across, so a
+        # settings.json last saved months before it was corrupted would land
+        # already looking ancient and be reaped on the spot.
+        ancient = time.time() - self.old()
+        self.path.write_text(self.TRUNCATED, encoding="utf8")
+        os.utime(self.path, (ancient, ancient))
+        before = time.time()
+
+        preserved = quarantine_corrupt(self.path)
+
+        self.assertGreaterEqual(preserved.stat().st_mtime, before - 1)
 
 
 if __name__ == "__main__":

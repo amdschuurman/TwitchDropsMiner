@@ -158,6 +158,115 @@ def test_save_settings_does_not_post_a_raw_dom_language(path):
     )
 
 
+@pytest.mark.parametrize("path", APP_JS_COPIES)
+def test_a_clear_declares_which_list_it_believed_was_stored(path):
+    """The intent flag says "emptying is deliberate", not "emptying THIS list is".
+
+    Every single-game-removal gesture carries ``allowEmptyGames`` so that
+    removing your last game works, and ``saveSettings`` POSTs the whole list as
+    authoritative. So a tab that loaded while the list was ``['A']`` sends a
+    request byte-identical to a user clearing a three-game list, and three games
+    are wiped. The destructive case therefore also has to state what the client
+    believed was stored, which is the only thing in the payload that can tell
+    the two apart.
+    """
+    body = extract_function(_read(path), "saveSettings")
+
+    flag = re.search(
+        r"const\s+clearingWatchList\s*=\s*allowEmptyGames\s*&&\s*"
+        r"gamesToWatch\.length\s*===?\s*0",
+        body,
+    )
+    assert flag, (
+        f"{path}: saveSettings() must derive clearingWatchList from BOTH the intent flag "
+        "and an actually-empty list; the flag alone is true for every single-game removal"
+    )
+    sent = [
+        line for line in body.splitlines() if re.search(r"\bexpected_games_to_watch\s*:", line)
+    ]
+    assert len(sent) == 1, (
+        f"{path}: saveSettings() must send expected_games_to_watch exactly once, found {sent!r}"
+    )
+    assert "clearingWatchList" in sent[0], (
+        f"{path}: expected_games_to_watch must ride only on a clear: {sent[0].strip()}"
+    )
+    assert "state.serverGamesToWatch" in sent[0], (
+        f"{path}: expected_games_to_watch must carry the SERVER-sent list; "
+        f"state.settings.games_to_watch is the locally edited one: {sent[0].strip()}"
+    )
+
+
+@pytest.mark.parametrize("path", APP_JS_COPIES)
+def test_the_server_list_snapshot_is_copied_not_aliased(path):
+    """An alias silently defeats the whole guard.
+
+    ``updateSettingsUI`` is the only place a server payload lands. The watch-list
+    gestures ``push``/``splice`` ``state.settings.games_to_watch`` IN PLACE, so
+    an aliased snapshot is rewritten by the local edit and the concurrency check
+    ends up comparing the edited list against itself - which always matches.
+    """
+    body = extract_function(_read(path), "updateSettingsUI")
+
+    assert re.search(
+        r"state\.serverGamesToWatch\s*=\s*\[\s*\.\.\.\(\s*settings\.games_to_watch", body
+    ), f"{path}: updateSettingsUI() must snapshot games_to_watch as a spread COPY"
+    aliased = re.search(
+        r"state\.serverGamesToWatch\s*=\s*settings\.games_to_watch\s*(\|\||\?\?|;)", body
+    )
+    assert aliased is None, (
+        f"{path}: state.serverGamesToWatch must never alias settings.games_to_watch"
+    )
+
+
+@pytest.mark.parametrize("path", APP_JS_COPIES)
+def test_a_refused_clear_is_said_out_loud(path):
+    """A silent refusal is the regression this whole wave is about.
+
+    The server refuses the write and re-broadcasts the stored settings, so every
+    view just snaps back with no explanation. Without a console line the operator
+    sees their "Deselect All" undo itself and has nothing to look at.
+    """
+    body = extract_function(_read(path), "reconcileSettingsSave")
+
+    assert "addConsoleLine(" in body, (
+        f"{path}: reconcileSettingsSave() must report a refused clear on the console"
+    )
+    assert re.search(r"updateSettingsUI\(|state\.settings\.games_to_watch\s*=", body), (
+        f"{path}: reconcileSettingsSave() must resync this tab; leaving it on an empty list "
+        "the server does not have is how the next save ships a stale expectation"
+    )
+
+
+@pytest.mark.parametrize("path", APP_JS_COPIES)
+def test_the_farm_toggle_reads_the_watch_list_at_click_time(path):
+    """A card outlives the render that built it, and the flag it captured.
+
+    ``removeGameFromWatch``, ``toggleGameWatch`` and ``deselectAllGames`` each
+    change the list and re-render the Settings tab WITHOUT re-rendering the
+    inventory, so live cards keep the old ``watchListEmpty``. Branching on it
+    takes the "no filter active" path and overwrites a list somebody has since
+    filled with every-game-but-this-one.
+    """
+    body = extract_function(_read(path), "renderInventory")
+
+    handler = re.search(
+        r"farmToggle\.addEventListener\('click'.*?\n        \}\);", body, re.S
+    )
+    assert handler, f"{path}: could not find the farm-toggle click handler"
+    # Comments explaining the fix legitimately name the removed variable, so
+    # only the executable lines are searched.
+    code = "\n".join(
+        line for line in handler.group(0).splitlines() if not line.strip().startswith("//")
+    )
+    assert "watchListEmpty" not in code, (
+        f"{path}: the farm-toggle click handler must not branch on the render-time "
+        "watchListEmpty; read the list again at click time"
+    )
+    assert re.search(r"currentlyEmpty\s*=\s*current\.length\s*===?\s*0", code), (
+        f"{path}: the handler must compute emptiness from the list it just read"
+    )
+
+
 @pytest.mark.parametrize(
     "function_name",
     ["toggleGameWatch", "removeGameFromWatch", "deselectAllGames"],
@@ -173,7 +282,10 @@ def test_user_gestures_still_declare_intent_to_empty(path, function_name):
     )
 
 
-@pytest.mark.parametrize("function_name", ["autoCleanWantedQueue", "saveSettings"])
+@pytest.mark.parametrize(
+    "function_name",
+    ["autoCleanWantedQueue", "saveSettings", "reconcileSettingsSave", "renderInventory"],
+)
 def test_both_app_js_copies_stay_in_lockstep(function_name):
     """A fix that lands in one copy only is a fix waiting to be undone."""
     served = extract_function(_read(SERVED_APP_JS), function_name)

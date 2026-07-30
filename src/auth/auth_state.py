@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-import os
 from typing import TYPE_CHECKING, cast
 
 import aiohttp
 from yarl import URL
 
+from src.api.http_client import CookieJarStore
 from src.config import COOKIES_PATH
 from src.exceptions import MinerException
 from src.i18n import _
@@ -41,6 +40,9 @@ class _AuthState:
         self._twitch: Twitch = twitch
         self._lock = asyncio.Lock()
         self._logged_in = asyncio.Event()
+        # Same store the HTTP client writes the jar with, so the login write and
+        # the shutdown write are atomic in exactly the same way.
+        self._cookie_store = CookieJarStore(COOKIES_PATH)
         self.user_id: int
         self.device_id: str
         self.session_id: str
@@ -284,11 +286,27 @@ class _AuthState:
             cookie["persistent"] = str(self.user_id)
             logger.info(f"Login successful, user ID: {self.user_id}, login: {self.user_login}")
             login_form.update(_.t["login"]["status"]["logged_in"], self.user_id, self.user_login)
-            # update our cookie and save it
+            # update our cookie and save it - atomically, and 0o600 by
+            # construction. A crash mid-write here would leave a truncated jar
+            # holding the token that was just obtained, so the very next start
+            # would come up logged out. See CookieJarStore.
             jar.update_cookies(cookie, client_info.CLIENT_URL)
-            jar.save(COOKIES_PATH)
-            with contextlib.suppress(OSError):
-                os.chmod(COOKIES_PATH, 0o600)
+            try:
+                self._cookie_store.save(jar)
+            except Exception:
+                # Persisting the jar is not what makes this login work: the
+                # token and the user_id are already in memory and every request
+                # from here on uses them. Letting a full disk or a read-only
+                # data directory escape would abort _validate() instead, and
+                # since Twitch.get_auth() - so every GQL request - waits on it,
+                # the miner would mine nothing at all over a file it does not
+                # need until the NEXT start. So report it and stay logged in.
+                logger.error(
+                    f"Could not save the cookie jar to {self._cookie_store.path}. "
+                    "This session is live and mining continues, but it was not written "
+                    "to disk, so the next start will ask for a new login.",
+                    exc_info=True,
+                )
         self._logged_in.set()
 
     def invalidate(self):

@@ -99,16 +99,26 @@ class TestSpadeWatchEvents(unittest.IsolatedAsyncioTestCase):
         twitch._auth_state.user_id = 12345
         stream = _make_stream(twitch)
 
-        first = _decode_spade_events(stream._spade_payload)[0]["properties"]["client_time"]
-        second_raw = stream._spade_payload
-        second = _decode_spade_events(second_raw)[0]["properties"]["client_time"]
+        # Freeze the clock into a known sequence. Comparing two LIVE isonow()
+        # readings for equality was flaky in the other direction: isonow() has
+        # millisecond resolution, so on a busy machine the two property accesses
+        # straddled a tick and the assertion failed. Stubbing the clock asserts
+        # the property directly — client_time is re-read on EVERY access —
+        # instead of racing it (regression: this was a cached_property before,
+        # which froze client_time to a stale value).
+        stamps = ["2026-01-01T00:00:00.000Z", "2026-01-01T00:00:01.000Z"]
+        with patch("src.models.channel.isonow", side_effect=stamps) as isonow:
+            first_raw = stream._spade_payload
+            second_raw = stream._spade_payload
 
-        # Not asserting the timestamps differ (that'd be flaky at sub-second
-        # resolution) — asserting the payload is rebuilt fresh each access
-        # rather than frozen from the first read (regression: this was a
-        # cached_property before, which froze client_time to a stale value).
-        self.assertEqual(first, second)
-        self.assertIsNot(stream._spade_payload, second_raw)
+        self.assertEqual(isonow.call_count, 2)
+        self.assertIsNot(first_raw, second_raw)
+        self.assertEqual(
+            _decode_spade_events(first_raw)[0]["properties"]["client_time"], stamps[0]
+        )
+        self.assertEqual(
+            _decode_spade_events(second_raw)[0]["properties"]["client_time"], stamps[1]
+        )
 
     async def test_send_watch_posts_to_spade_and_returns_true_for_204(self):
         twitch = MagicMock()

@@ -9,8 +9,9 @@ import os
 import secrets
 import time
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import socketio
 from fastapi import FastAPI, HTTPException, Request
@@ -259,6 +260,9 @@ def _load_channel_points_history() -> dict:
 #
 # Public (never gated): the setup/login pages, favicon/logo/manifest, static
 # assets, /healthz (Docker liveness — must return 200 with no session),
+# /api/health/mining (uptime-monitor probe: booleans, counts, a coarse mining
+# state and the Twitch login only — no tokens, no channel or campaign names;
+# public by EXACT path, so a trailing slash on it is gated like anything else),
 # /api/pair/claim (the one-time pairing code IS the credential),
 # /api/session/bootstrap (validates its own token), the instance-switcher
 # registry reads (GET /api/instance + GET /api/instances), and the static
@@ -432,6 +436,13 @@ _PUBLIC_PATHS = {
     "/favicon.ico", "/logo.png", "/manifest.json",
     "/api/pair/claim",   # Discord bot pairing — the one-time code is the credential
     "/healthz",          # Docker/orchestrator liveness probe — must pass with no session
+    # Uptime-monitor probe — booleans/counts/coarse state, no secrets.
+    # EXACT-PATH entry, like every other member of this set: _is_public_request
+    # compares with ``in``, never by prefix. So "/api/health/mining/" — the same
+    # URL with a trailing slash — is NOT public and answers 401, which a monitor
+    # that inverts a match on '"ok":false' reads as healthy forever. Point
+    # monitors at this literal path; do not assume a prefix match exists.
+    "/api/health/mining",
     "/api/session/bootstrap",  # validates its own ?token= parameter
     # Static metadata the very first page render needs before any credential
     # exists (language picker, translation bundle, footer version).
@@ -446,6 +457,14 @@ _UNPROTECTED_PREFIXES = ("/static/",)
 
 
 def _is_public_request(path: str, method: str) -> bool:
+    """Whether ``path`` bypasses the auth gate.
+
+    Membership is EXACT for ``_PUBLIC_PATHS`` / ``_PUBLIC_GET_PATHS`` — only
+    ``_UNPROTECTED_PREFIXES`` matches by prefix. Keeping the allowlist exact is
+    deliberate (a prefix entry under ``/api/`` would open every path beneath it),
+    but it also means a caller one trailing slash off a public path gets a 401:
+    see the ``/api/health/mining`` entry.
+    """
     if path in _PUBLIC_PATHS:
         return True
     if path in _PUBLIC_GET_PATHS and method in ("GET", "HEAD", "OPTIONS"):
@@ -704,6 +723,7 @@ class SettingsUpdate(BaseModel):
     drop_name_blacklist: list[str] | None = None
     auto_prioritize: bool | None = None
     auto_add_linked: bool | None = None
+    auto_clean_watchlist: bool | None = None
     tab_counter_enabled: bool | None = None
     make_predictions: bool | None = None
     bet_strategy: str | None = None
@@ -717,6 +737,11 @@ class SettingsUpdate(BaseModel):
     claim_moments: bool | None = None
     irc_chat_presence: bool | None = None
     irc_mention_notify: bool | None = None
+    # Request-only intent flag, NOT a setting: it authorizes emptying
+    # ``games_to_watch`` for this one request (the UI's "clear all" gesture).
+    # SettingsManager.update_settings pops it off the payload before any
+    # per-key write, so it can never be stored on Settings or in settings.json.
+    allow_empty_games_to_watch: bool | None = None
 
 
 class ProxyVerifyRequest(BaseModel):
@@ -947,6 +972,152 @@ async def serve_index(request: Request):
 async def healthz():
     """Unauthenticated liveness probe for Docker/orchestrators — no session state exposed."""
     return {"status": "ok"}
+
+
+_ProbeField = TypeVar("_ProbeField")
+
+
+class _MiningHealthProbe:
+    """Builds the public ``/api/health/mining`` body without ever raising.
+
+    Two properties are structural rather than incidental, so they live in a
+    class instead of one long endpoint body:
+
+    * **Nothing is disclosed beyond booleans, counts, a coarse state and the
+      Twitch login.** In particular the miner's own status line is NOT exposed:
+      it embeds the watched channel name and, in manual mode, the targeted game
+      (``src/core/client.py:741-744``, ``:349``) — exactly the campaign detail
+      this unauthenticated endpoint promises not to leak. ``state`` is derived
+      from the miner OBJECTS, never by matching that localized text.
+    * **One failing read cannot corrupt the rest of the report.** Every field
+      goes through :meth:`_read`, which isolates it in its own ``try``, so a
+      raising attribute no longer zeroes its neighbours — and it marks the whole
+      report degraded, so ``ok`` can never stay true while the probe was reading
+      blind.
+    * **``mining`` means mining, not "some channel is open".** A held
+      ``watching_channel`` is not proof of mining: idle-watching sets it too. So
+      ``state`` asks the miner's state machine whether it is idle, and an
+      idle-watching miner reports ``idle`` — see :meth:`_idle_watching`.
+    """
+
+    # The complete coarse-state vocabulary. An external watchdog matches on
+    # these, so they are plain ASCII, lowercase, and never localized.
+    STARTING = "starting"  # a miner object is missing, or its state is unreadable
+    IDLE = "idle"  # up, but not mining: nothing minable, or only idle-watching
+    WATCHING = "watching"  # actively watching a channel FOR DROPS
+    PAUSED = "paused"  # deliberately paused by the operator
+
+    def __init__(self, twitch: Twitch | None, gui: WebGUIManager | None) -> None:
+        self._twitch = twitch
+        self._gui = gui
+        self._degraded = twitch is None or gui is None
+
+    def _read(self, reader: Callable[[], _ProbeField], default: _ProbeField) -> _ProbeField:
+        """Read one field; on any failure fall back and mark the report degraded."""
+        try:
+            return reader()
+        except Exception:
+            self._degraded = True
+            return default
+
+    def _games_to_watch(self) -> list[str]:
+        # None mid-boot is normal, not an error.
+        return list(getattr(self._twitch.settings, "games_to_watch", None) or [])  # type: ignore[union-attr]
+
+    def _wanted_games_count(self) -> int:
+        return len(self._twitch.wanted_games)  # type: ignore[union-attr]
+
+    def _idle_watching(self) -> bool:
+        """True when the held channel handle is an IDLE-watch handle, not mining.
+
+        ``watching_channel`` cannot tell the two apart on its own. The IDLE branch
+        of the miner's state machine calls ``watch()`` too, to keep a configured
+        idle channel open (channel points, predictions) while there is nothing
+        minable - ``src/core/client.py:328-351``. Reading the handle alone
+        therefore reported ``watching`` / ``mining: true`` for a miner that was
+        mining nothing at all, with ``wanted_games_count: 0`` right next to it:
+        the silent-failure shape this endpoint exists to surface, restated by the
+        monitor as "green".
+
+        The miner's own state machine is the marker. It stays in ``State.IDLE``
+        for the whole idle-watch (the IDLE branch never changes state, and the
+        bottom-of-loop wait blocks there until a real state change arrives -
+        ``src/core/client.py:758-768``), while genuine mining is entered from
+        ``State.CHANNEL_SWITCH`` and stays in it (``:729-731``). So a handle held
+        while the state is ``IDLE`` is an idle handle.
+
+        ``Twitch._idle_channels_set`` (``:336``/``:346``) is deliberately NOT
+        consulted, even though it is the idle marker WatchService uses
+        (``src/services/watch_service.py:187``): it is only ever reset on the NEXT
+        entry into the IDLE branch, so it stays populated once mining resumes.
+        Reading it would trade this false ``watching`` for an equally false
+        ``idle``.
+
+        Raises rather than guessing when the miner's state cannot be read at all;
+        :meth:`_read` turns that into ``starting`` plus a degraded report, which
+        is the honest answer for "could not tell" - and never the answer that
+        keeps a monitor green.
+        """
+        from src.config import State
+
+        return self._twitch._state is State.IDLE  # type: ignore[union-attr]
+
+    def _state(self) -> str:
+        """Coarse lifecycle state, derived from the miner objects only."""
+        if self._twitch is None or self._gui is None:
+            return self.STARTING
+        if self._twitch.is_paused():
+            return self.PAUSED
+        if self._twitch.watching_channel.get_with_default(None) is None:
+            return self.IDLE
+        # A channel IS being watched, which only counts as mining while the
+        # miner's state machine is out of its idle branch - see _idle_watching.
+        return self.IDLE if self._idle_watching() else self.WATCHING
+
+    def _login(self) -> str | None:
+        return self._gui.login.get_status().get("user_login")  # type: ignore[union-attr]
+
+    def body(self) -> dict[str, Any]:
+        games_to_watch: list[str] = self._read(self._games_to_watch, [])
+        wanted_games_count = self._read(self._wanted_games_count, 0)
+        state = self._read(self._state, self.STARTING)
+        login = self._read(self._login, None)
+        watchlist_empty = not games_to_watch
+        return {
+            # Keyword an external monitor matches on: false whenever the watch
+            # list is empty (nothing to mine), the miner is not up yet, or a
+            # state read failed and the rest of this body is only half-true.
+            "ok": not self._degraded and not watchlist_empty,
+            "watchlist_empty": watchlist_empty,
+            "games_to_watch_count": len(games_to_watch),
+            "wanted_games_count": wanted_games_count,
+            "state": state,
+            # Redundant with state == WATCHING, kept because monitors already
+            # alert on it.
+            "mining": state == self.WATCHING,
+            "login": login,
+        }
+
+
+@app.get("/api/health/mining")
+async def health_mining():
+    """Unauthenticated readiness probe an uptime monitor can keyword-match on.
+
+    Liveness (``/healthz``) only proves the web server answers; this reports
+    whether the miner has anything to mine at all. An empty ``games_to_watch``
+    is the silent-failure state that once cost five days of mining, so it
+    flips ``ok`` to false and gives a monitor something to alert on.
+
+    Always answers HTTP 200 — never 5xx — so the Docker HEALTHCHECK and the
+    container restart policy are unaffected no matter what this reports, and
+    degrades to ``ok: false`` while the miner is still starting up.
+
+    Public (see ``_PUBLIC_PATHS``): a monitor has no session token, so the body
+    is deliberately limited to booleans, counts, a coarse ``state`` and the
+    Twitch login. No tokens, no cookies, no channel or campaign names — see
+    ``_MiningHealthProbe`` for how that is kept true.
+    """
+    return _MiningHealthProbe(twitch_client, gui_manager).body()
 
 
 @app.get("/api/status")

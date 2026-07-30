@@ -17,7 +17,7 @@ if __name__ == "__main__":
     truststore.inject_into_ssl()
 
     from src.config import FILE_FORMATTER
-    from src.config.settings import Settings
+    from src.config.settings import LanguageNormalizer, Settings
     from src.core.client import Twitch
     from src.exceptions import CaptchaRequired
     from src.i18n import _
@@ -62,8 +62,16 @@ if __name__ == "__main__":
     # client run
     async def main():
         # set language
+        #
+        # Via LanguageNormalizer.apply, never _.set_language directly: this call
+        # sits OUTSIDE the try further down, so the bare setter's ValueError
+        # escaped asyncio.run() and killed the process - under
+        # `restart: unless-stopped` that is a container restart loop, over a
+        # single unreadable file in lang/. apply() logs and falls back to the
+        # language already loaded instead, and leaves settings.language alone so
+        # the stored choice survives the next save.
         if settings.language:
-            _.set_language(settings.language)
+            LanguageNormalizer.apply(settings.language)
 
         from src.services import drop_minutes_cache as _dmc
         _dmc.load()
@@ -173,9 +181,27 @@ if __name__ == "__main__":
         else:
             logger.info("Normal shutdown - proceeding")
         # save the application state
+        #
+        # Guarded, because this is the LAST thing a clean shutdown does and it is
+        # the only thing left that can still fail. The write became atomic, so it
+        # now needs write permission on the data DIRECTORY and room for a second
+        # copy: a read-only or full data/ turns a normal SIGTERM into an uncaught
+        # exception here, a non-zero exit code, and under
+        # `restart: unless-stopped` a restart loop - i.e. a disk problem
+        # presenting as a crashing container. The exit status the run actually
+        # earned is what gets reported either way; a save that could not be made
+        # durable is a logged failure, not a different outcome.
         logger.info("Saving application state")
-        settings.save()
-        logger.info("Application state saved")
+        try:
+            settings.save()
+        except Exception:
+            logger.exception(
+                "Could not save the application state on shutdown - settings changed "
+                "during this run may be lost. Check that the data directory is writable "
+                f"and has free space. Exiting with status {exit_status} regardless"
+            )
+        else:
+            logger.info("Application state saved")
         logger.info(f"=== Exiting with status code: {exit_status} ===")
         sys.exit(exit_status)
 

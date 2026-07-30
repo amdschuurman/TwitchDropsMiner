@@ -31,6 +31,7 @@ From this fork:
 - CORS locked to same-origin by default; extendable with `TDM_TRUSTED_ORIGINS`.
 - Proxy URL validation and a non-root Docker container (UID 1000) with an entrypoint that fixes volume ownership on upgrade.
 - Reliability hardening: the main loop recovers from miner, request, GQL and websocket errors with exponential backoff; watch loops have timeouts; online checks tolerate per-batch GQL failures.
+- Watch list guard: a settings write can no longer empty the games-to-watch list without an explicit user gesture, and `GET /api/health/mining` gives an uptime monitor something to alert on when there is nothing left to mine.
 - CI publishes multi-arch images to `ghcr.io/amdschuurman/twitchdropsminer`.
 
 ## Quick start
@@ -171,6 +172,119 @@ from one IP may get flagged by Twitch; the dashboard warns about this.
 | `TDM_ALLOW_PRIVATE_WEBHOOKS` | unset | `true` allows Discord-webhook URLs that resolve to private/LAN addresses (self-hosted receivers). By default such URLs are rejected as an SSRF guard. |
 | `TZ` | UTC | Container timezone, used for timestamps in stats and alerts. |
 
+## Watch list safety
+
+An empty games-to-watch list means the miner mines nothing, and no error is
+raised while it sits idle, so that state can only be reached deliberately.
+
+- `auto_clean_watchlist` (Settings tab, "Auto-remove fully claimed games from
+  the watch list") removes a game from the watch list once every campaign for
+  it is fully claimed. It is off by default, and the removal is permanent, so
+  turn it on only if you look at the watch list yourself now and then. Even
+  when it is on, the cleanup refuses to remove the last remaining game.
+- Emptying the list takes an explicit action in the dashboard: unchecking the
+  last game, "Deselect All", or removing the last entry from the wanted queue.
+  Any other request that would leave the list empty is ignored, and the server
+  logs `Refused to clear the games-to-watch list without explicit intent` to
+  the dashboard console.
+- A value the server rejects (an empty language, for example) is logged as
+  `Setting rejected: <key> = <value> (<reason>)` and skipped. The rest of the
+  same save still applies, and the rejected value is never stored.
+
+The reason for all three: the dashboard used to run that cleanup on every page
+load and socket reconnect and save the result. On 2026-07-24 it emptied the
+watch list of an account watching a single game whose drops were all claimed,
+and the miner mined nothing for the next five days without reporting a problem.
+
+### When `settings.json` cannot be read
+
+A `settings.json` the miner cannot parse (an interrupted write, a bad disk
+block, a hand edit with a comma missing) is no longer quietly replaced by
+defaults. The unreadable file is moved aside to `settings.json.corrupt` next to
+it, and the log says so:
+
+```text
+Corrupt JSON in data/settings.json: <reason>. The unreadable file has been kept
+as data/settings.json.corrupt - recover any values you need from it. Starting
+from defaults for now, which for settings.json means an EMPTY games-to-watch
+list, so nothing will be mined until it is set again.
+```
+
+Defaults mean an empty watch list, so the miner mines nothing until you set one,
+and `GET /api/health/mining` answers `"ok":false` for exactly that reason. Your
+old list is still there in `settings.json.corrupt`: open it in a text editor,
+copy the `games_to_watch` entries back in from the Settings tab, then delete the
+file. A second corruption does not overwrite the first one, it becomes
+`settings.json.corrupt.1`, then `.2`, and so on.
+
+The other line worth recognising is:
+
+```text
+Refused to save an empty games-to-watch list over the stored ['Overwatch'] -
+nobody asked for it to be cleared, and an empty list means nothing gets mined.
+Restoring the stored list.
+```
+
+Something tried to save an empty watch list while a non-empty one was on disk
+and no deliberate "clear all" was behind it. The stored list is put back both in
+memory and on disk, and mining carries on. Emptying the list on purpose from the
+dashboard is unaffected.
+
+## Health and monitoring
+
+`GET /api/health/mining` reports whether the miner has anything to mine. It
+needs no authentication and always answers HTTP 200, so it cannot interfere
+with the Docker health check (`/healthz`, unchanged) or a container restart
+policy.
+
+Point the monitor at that exact path, with GET and no trailing slash. The
+allowlist that makes the endpoint public matches by exact path, so
+`/api/health/mining/` is a different, gated URL: it answers 401 without a
+credential, and a bodyless 307 redirect with one. Neither reply contains an
+`ok` field, and a monitor that alerts by inverting a match on `"ok":false`
+counts "keyword absent" as healthy, so one trailing slash buys a monitor that
+stays green through the whole outage it was installed to catch.
+
+```json
+{
+  "ok": false,
+  "watchlist_empty": true,
+  "games_to_watch_count": 0,
+  "wanted_games_count": 0,
+  "state": "idle",
+  "mining": false,
+  "login": "yourtwitchname"
+}
+```
+
+`ok` is false whenever the watch list is empty, the miner has not finished
+starting up, or the probe could not read part of its own state. That is the
+field to alert on: point an uptime monitor at the endpoint, have it
+keyword-match the literal `"ok":false`, and invert the match so a hit counts as
+down.
+
+Note the missing space. The sample above is pretty-printed for reading, but the
+response goes out minified, so the bytes on the wire are
+`{"ok":false,"watchlist_empty":true,...}`. A monitor configured to look for
+`"ok": false` matches nothing and stays green straight through the outage it was
+set up to catch.
+
+`state` is a coarse lifecycle value, one of `starting`, `idle`, `watching` or
+`paused`. It is derived from the miner's own objects, not from the status line
+the dashboard displays. `watching` means the miner is watching a channel **for
+drops**; `idle` means it is not mining, which covers both "nothing to mine" and
+an idle watch, where a channel is held open for channel points or predictions
+while no campaign is making progress. Having a channel open is therefore not
+enough to report `watching`. `mining` is true only for `watching`. `login` is
+the Twitch account name, or null before login. Since the endpoint is public it
+returns nothing beyond those booleans, counts, the state and the login: no
+tokens, no channel names, no campaign detail.
+
+`ok` does not drop while the miner is idle, because an idle miner with a healthy
+watch list is not a fault. If a miner that stays idle should page you, add a
+second rule that matches `"mining":false` and give it a delay long enough not to
+fire on the normal gaps between channel switches.
+
 ## Security notes
 
 - The web server binds to loopback by default. For remote access, either bind
@@ -178,6 +292,12 @@ from one IP may get flagged by Twitch; the dashboard warns about this.
   behind an authenticating reverse proxy and set `TDM_AUTH_DISABLED=true`
   plus `TDM_TRUSTED_ORIGINS`.
 - The API token lives in `data/api_token`; delete the file to rotate it.
+- `GET /api/health/mining` is public by design. The auth gate matches it by
+  path, so it answers without a session cookie, a bearer token or the web
+  password, which is what lets an external uptime monitor reach it. That is also
+  why its body is limited to booleans, counts, the coarse `state` and the Twitch
+  login: anyone who can reach the port can read it, so anything richer added to
+  that response is disclosed to them too.
 - The Docker image runs as UID 1000. On the first start after upgrading from
   a root-based image, the entrypoint re-chowns `./data` and `./logs`;
   `data/cookies.jar` (your Twitch session) survives the upgrade.
@@ -190,6 +310,17 @@ from one IP may get flagged by Twitch; the dashboard warns about this.
   time; it desyncs progress.
 - Requires Python 3.12 or newer when running from source. Persistent state is
   stored in `data/`; back it up before updating.
+- `web/index.html` and `web/static/app.js` are the files the web server serves
+  and are the authoritative copies. `src/web/index.html` and `src/web/app.js`
+  are unserved mirrors: update a mirror from the served copy, never the other
+  way round. The mirror `app.js` still assigns interpolated markup to
+  `innerHTML` (`src/web/app.js:1780`, `:3648`) and puts raw markup on a drag
+  transfer (`:2216`), all of which `tests/test_frontend_dom_safety.py` forbids
+  in the served copy, so copying the mirror over it would reintroduce those
+  holes. `tests/test_watchlist_guard.py` compares the two copies of the
+  functions this watch-list fix touches (`autoCleanWantedQueue`,
+  `saveSettings`) and fails when those drift; it does not compare the files as a
+  whole, which do legitimately differ elsewhere.
 - Screenshots of the dashboard are in `docs/screenshots/`.
 
 ## Acknowledgments

@@ -1673,7 +1673,8 @@ function renderInventory() {
                 current.push(gameName);
             }
             state.settings.games_to_watch = current;
-            saveSettings();
+            // Skipping the only watched game empties the list on purpose.
+            saveSettings({ allowEmptyGames: true });
             renderInventory();
         });
 
@@ -1748,16 +1749,20 @@ function renderInventory() {
 }
 
 function autoCleanWantedQueue() {
+    // Opt-in only (default off). This path DELETES watched games and persists the
+    // result from the initial_state handler above — i.e. on every page load / socket
+    // reconnect, with no user gesture behind it. Left enabled by default it silently
+    // stopped an unattended miner for days, so it stays inert unless asked for.
+    if (!state.settings?.auto_clean_watchlist) return;
     const watchList = state.settings.games_to_watch;
     if (!watchList || watchList.length === 0) return;
     const allCampaigns = Object.values(state.campaigns);
     if (allCampaigns.length === 0) return;
 
-    // Runs silently on every page load/F5 (see the initial_state handler
-    // above) — reported on Discord as "game settings reset" for whichever
-    // games happen to be fully claimed, since removal here looks identical
-    // to a settings bug from the outside. Log what and why so it reads as
-    // intentional cleanup instead of a mystery reset.
+    // Runs on every page load/F5 (see the initial_state handler above) — reported on
+    // Discord as "game settings reset" for whichever games happen to be fully claimed,
+    // since removal here looks identical to a settings bug from the outside. Log what
+    // and why so it reads as intentional cleanup instead of a mystery reset.
     const removedGames = [];
     let changed = false;
     const cleaned = watchList.filter(gameName => {
@@ -1776,6 +1781,13 @@ function autoCleanWantedQueue() {
     });
 
     if (changed) {
+        // Hard floor: an empty watch list makes the miner mine nothing at all, so the
+        // cleanup never removes the last entry — that would silently halt mining. Say so
+        // on the console instead of leaving the user with a queue that never shrinks.
+        if (cleaned.length === 0) {
+            addConsoleLine(`Kept on watch list (removing would leave nothing to mine): ${removedGames.join(', ')}`);
+            return;
+        }
         state.settings.games_to_watch = cleaned;
         saveSettings();
         renderGamesToWatch();
@@ -1865,6 +1877,8 @@ function updateSettingsUI(settings) {
     if (autoPrioritizeToggle) autoPrioritizeToggle.checked = !!settings.auto_prioritize;
     const autoAddLinkedToggle = document.getElementById('auto-add-linked-toggle');
     if (autoAddLinkedToggle) autoAddLinkedToggle.checked = !!settings.auto_add_linked;
+    const autoCleanWatchlistToggle = document.getElementById('auto-clean-watchlist-toggle');
+    if (autoCleanWatchlistToggle) autoCleanWatchlistToggle.checked = !!settings.auto_clean_watchlist;
     const tabCounterToggle = document.getElementById('tab-counter-toggle');
     if (tabCounterToggle) tabCounterToggle.checked = settings.tab_counter_enabled !== false;
 
@@ -2311,7 +2325,8 @@ function toggleGameWatch(gameName, checked) {
     state.settings.games_to_watch = games;
     renderGamesToWatch();
     renderChannels();
-    saveSettings();
+    // Unchecking the last game empties the list on purpose.
+    saveSettings({ allowEmptyGames: true });
 }
 
 function removeGameFromWatch(gameName) {
@@ -2322,7 +2337,8 @@ function removeGameFromWatch(gameName) {
         state.settings.games_to_watch = games;
         renderGamesToWatch();
         renderChannels();
-        saveSettings();
+        // Removing the last game empties the list on purpose.
+        saveSettings({ allowEmptyGames: true });
     }
 }
 
@@ -2353,7 +2369,8 @@ function deselectAllGames() {
     state.settings.games_to_watch = [];
     renderGamesToWatch();
     renderChannels();
-    saveSettings();
+    // "Deselect All" is the explicit clear-everything gesture.
+    saveSettings({ allowEmptyGames: true });
 }
 
 function selectLinkedGames() {
@@ -2767,7 +2784,11 @@ function addChannelOverride() {
     if (newRow) _commitOverrideRow(newRow);
 }
 
-async function saveSettings() {
+/**
+ * @param {{allowEmptyGames?: boolean}} [options] - allowEmptyGames marks this one request
+ *   as a deliberate user gesture that may leave games_to_watch empty (e.g. "Deselect All").
+ */
+async function saveSettings(options = {}) {
     if (!state.settingsLoaded) {
         // A change event fired (e.g. browser restoring form state on reload) before the
         // server's real settings arrived via initial_state — state.settings is still {}
@@ -2777,13 +2798,29 @@ async function saveSettings() {
         console.warn('saveSettings() called before initial settings loaded — ignoring');
         return;
     }
+    // The #language <select> is filled in asynchronously (its options arrive with the
+    // translations), so an early change event finds selectedIndex === -1 and value ''.
+    // '' is not a valid language server-side, so fall back to the loaded setting and omit
+    // the key entirely when neither source has a real value — never POST an empty one.
+    const languageSelect = document.getElementById('language');
+    const language = (languageSelect && languageSelect.selectedIndex >= 0 && languageSelect.value)
+        ? languageSelect.value
+        : (state.settings.language || '');
+
+    // An empty games_to_watch means "mine nothing", so it is only ever sent when the user
+    // explicitly asked for that (allowEmptyGames). Otherwise the key is omitted and the
+    // backend leaves the stored list alone (the endpoint dumps with exclude_unset=True).
+    const gamesToWatch = state.settings.games_to_watch || [];
+    const allowEmptyGames = options.allowEmptyGames === true;
+
     const settings = {
         dark_mode: document.getElementById('dark-mode').checked,
-        language: document.getElementById('language').value,
+        ...(language ? { language } : {}),
         connection_quality: parseInt(document.getElementById('connection-quality').value),
         minimum_refresh_interval_minutes: parseInt(document.getElementById('minimum-refresh-interval').value),
         proxy: state.settings.proxy || '',
-        games_to_watch: state.settings.games_to_watch || [],
+        ...(gamesToWatch.length > 0 || allowEmptyGames ? { games_to_watch: gamesToWatch } : {}),
+        ...(allowEmptyGames ? { allow_empty_games_to_watch: true } : {}),
         inventory_filters: getInventoryFilters(),
         mining_benefits: {
             "DIRECT_ENTITLEMENT": document.getElementById('mining-benefit-item')?.checked,
@@ -2806,6 +2843,7 @@ async function saveSettings() {
         scheduler_stop: document.getElementById('scheduler-stop')?.value || '08:00',
         auto_prioritize: document.getElementById('auto-prioritize-toggle')?.checked || false,
         auto_add_linked: document.getElementById('auto-add-linked-toggle')?.checked || false,
+        auto_clean_watchlist: document.getElementById('auto-clean-watchlist-toggle')?.checked || false,
         tab_counter_enabled: document.getElementById('tab-counter-toggle')?.checked ?? true,
         make_predictions: document.getElementById('set-make-predictions')?.checked || false,
         bet_strategy: document.getElementById('set-bet-strategy')?.value || 'SMART',
@@ -3744,6 +3782,11 @@ document.addEventListener('DOMContentLoaded', () => {
         saveSettings();
         if (this.checked) autoAddLinkedGames();
     });
+    document.getElementById('auto-clean-watchlist-toggle')?.addEventListener('change', function() {
+        state.settings.auto_clean_watchlist = this.checked;
+        saveSettings();
+        if (this.checked) autoCleanWantedQueue();
+    });
     document.getElementById('tab-counter-toggle')?.addEventListener('change', function() {
         state.settings.tab_counter_enabled = this.checked;
         saveSettings();
@@ -4317,7 +4360,8 @@ function renderWantedItems(tree) {
             e.stopPropagation();
             const games = state.settings.games_to_watch || [];
             state.settings.games_to_watch = games.filter(g => g !== gameGroup.game_name);
-            saveSettings();
+            // Removing the last game empties the list on purpose.
+            saveSettings({ allowEmptyGames: true });
             renderGamesToWatch();
         });
 

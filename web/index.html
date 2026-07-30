@@ -26,7 +26,7 @@
                     <span id="connection-indicator" class="connected"><span class="conn-dot">●</span><span class="conn-text"> Connected</span></span>
                     <label for="language" class="language-selector">
                         <select id="language">
-                            <option value="en">🌐 EN</option>
+                            <option value="">🌐 EN</option>
                         </select>
                     </label>
                 </div>
@@ -526,9 +526,13 @@
                         <input type="checkbox" id="auto-prioritize-toggle">
                         <span id="auto-prioritize-label">Auto-prioritize by campaign end date</span>
                     </label>
-                    <label style="display:flex;align-items:center;gap:8px;margin:0 0 8px;font-size:.85rem;color:var(--text-muted,#aaa);cursor:pointer;">
+                    <label style="display:flex;align-items:center;gap:8px;margin:0 0 4px;font-size:.85rem;color:var(--text-muted,#aaa);cursor:pointer;">
                         <input type="checkbox" id="auto-add-linked-toggle">
                         <span id="auto-add-linked-label">Auto-add linked games to watch list</span>
+                    </label>
+                    <label style="display:flex;align-items:center;gap:8px;margin:0 0 8px;font-size:.85rem;color:var(--text-muted,#aaa);cursor:pointer;">
+                        <input type="checkbox" id="auto-clean-watchlist-toggle">
+                        <span id="auto-clean-watchlist-label">Auto-remove fully claimed games from the watch list (deletes them permanently; never removes the last one)</span>
                     </label>
 
                     <div class="games-container">

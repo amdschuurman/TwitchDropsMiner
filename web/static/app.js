@@ -1951,6 +1951,8 @@ function updateSettingsUI(settings) {
     if (webhookPointsEl) webhookPointsEl.value = settings.discord_webhook_points || '';
     const webhookMentionsEl = document.getElementById('discord-webhook-mentions');
     if (webhookMentionsEl) webhookMentionsEl.value = settings.discord_webhook_mentions || '';
+    const pingMentionEl = document.getElementById('discord-ping-mention');
+    if (pingMentionEl) pingMentionEl.value = settings.discord_ping_mention || '';
     const blacklistEl = document.getElementById('drop-blacklist-input');
     if (blacklistEl) blacklistEl.value = (settings.drop_name_blacklist || []).join(', ');
 
@@ -2951,6 +2953,7 @@ async function saveSettings(options = {}) {
         discord_webhook_drops: document.getElementById('discord-webhook-drops')?.value || '',
         discord_webhook_points: document.getElementById('discord-webhook-points')?.value || '',
         discord_webhook_mentions: document.getElementById('discord-webhook-mentions')?.value || '',
+        discord_ping_mention: document.getElementById('discord-ping-mention')?.value?.trim() || '',
         claim_channel_points: document.getElementById('claim-channel-points')?.checked ?? true,
         idle_channels: state.settings.idle_channels || [],
         idle_use_followed: document.getElementById('idle-use-followed')?.checked ?? false,

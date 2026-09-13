@@ -27,6 +27,64 @@ This file provides guidance to AI Agents when working with code in this reposito
    - Always update `README.md` and all agent instruction files when making changes.
    - The contents of all agent instruction files should be identical except for the `Specific Instructions` section. Any agent-specific instructions must be added to that section.
 
+## Live deployment (Arend's homelab)
+
+Host: **CT203 `lxc-personal`** (`.83`), compose file `/opt/twitchdrops/docker-compose.yml`.
+Moved there from the old VM101 path `/home/arend/docker/twitchdrops`; any doc or
+memory still naming that path is stale.
+
+| Container | Account | Dashboard port | Data dir |
+|---|---|---|---|
+| `twitch-drops-miner` | amdschuurman | 8113 | `/opt/twitchdrops/data` |
+| `twitch-drops-miner-2` | Enfinomori | 8114 | `/opt/twitchdrops/data2` |
+
+Release flow: push to `main` runs `.github/workflows/docker-release.yml`, which
+publishes `ghcr.io/amdschuurman/twitchdropsminer:latest` (multi-arch). Watchtower
+is disabled on this host, so the pull is manual:
+`cd /opt/twitchdrops && docker compose pull && docker compose up -d`.
+
+Discord notifications go to `#twitch-drops` in the Family Schuurman guild, one
+webhook per account, named `Twitch Drops ✦ amdschuurman` and
+`Twitch Drops ✦ Enfinomori`, both created with the Novaren bot
+(`Projecten/novaren/`). Each instance's `discord_webhook_drops`,
+`discord_webhook_points` and `discord_webhook_mentions` all point at that
+account's own webhook, and `discord_ping_mention` holds the owner's user
+mention so the message pings them. **The webhook URLs live in exactly one
+place: `settings.json` inside each container's data dir on CT203. There is no
+canonical copy anywhere else** - not in this repo, not in the novaren repo, not
+in a password manager entry. Lost one? Delete the webhook in Discord and make a
+new one.
+
+## Discord notifications
+
+Three webhook URLs and one mention string live in the Settings tab, under
+Discord Notifications, and are stored per instance in
+`<data dir>/settings.json` (mode 0600):
+
+| Setting | Fires on |
+|---|---|
+| `discord_webhook_drops` | a drop is claimed, and campaign-ending alerts |
+| `discord_webhook_points` | a channel-points chest is claimed, prediction results, the session report |
+| `discord_webhook_mentions` | your username is mentioned in chat (falls back to the points webhook) |
+| `discord_ping_mention` | not a webhook: the mention prepended to every message the three above send |
+
+A webhook that posts only `embeds` cannot notify anyone, because Discord pings
+on the `content` field and never on embed text. `discord_ping_mention` fills
+that field: set it to `<@USER_ID>` for a person or `<@&ROLE_ID>` for a role and
+every notification pings that target. Empty (the default) keeps the exact
+embeds-only body older versions sent.
+
+Every sender builds its body through `build_webhook_payload()` in
+`src/utils/discord_payload.py`, so there is one place to change and no sender
+can drift. When a mention is set the body also carries
+`allowed_mentions: {"parse": ["users", "roles"]}`, which makes the ping fire
+while keeping an `@everyone` quoted inside a chat-mention embed from pinging a
+whole server.
+
+A webhook URL is a credential: it is write-only in the dashboard's eyes,
+belongs in `settings.json` and nowhere else, and must never be pasted into a
+shell command line, a log, or a commit.
+
 ## Project Overview
 
 Twitch Drops Miner is a Python application that automatically mines timed Twitch drops without downloading stream data. It uses Twitch's GraphQL API and websocket connections to simulate watching streams while tracking drop progress.

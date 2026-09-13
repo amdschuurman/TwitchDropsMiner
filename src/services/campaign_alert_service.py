@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 import aiohttp
 
+from src.utils import build_webhook_payload
+
 if TYPE_CHECKING:
     from src.core.client import Twitch
     from src.models.campaign import DropsCampaign
@@ -82,7 +84,13 @@ class CampaignAlertService:
                     ],
                     "url": campaign.campaign_url,
                 }
-                asyncio.create_task(self._send_discord_webhook(webhook_url, {"embeds": [embed]}))
+                asyncio.create_task(self._send_discord_webhook(
+                    webhook_url,
+                    build_webhook_payload(
+                        [embed],
+                        getattr(self._twitch.settings, "discord_ping_mention", ""),
+                    ),
+                ))
 
         self._save_alerted()
 

@@ -6,6 +6,8 @@ import ssl
 import time
 from typing import TYPE_CHECKING
 
+from src.utils import build_webhook_payload
+
 if TYPE_CHECKING:
     from src.core.client import Twitch
 
@@ -151,6 +153,13 @@ class IRCService:
         try:
             import aiohttp
             async with aiohttp.ClientSession() as session:
-                await session.post(webhook_url, json={"embeds": [embed]}, timeout=aiohttp.ClientTimeout(total=10))
+                await session.post(
+                    webhook_url,
+                    json=build_webhook_payload(
+                        [embed],
+                        getattr(self._twitch.settings, "discord_ping_mention", ""),
+                    ),
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
         except Exception as e:
             logger.debug(f"Mention webhook failed: {e}")

@@ -14,6 +14,9 @@ from .async_helpers import (
 # Backoff
 from .backoff import ExponentialBackoff
 
+# Discord webhook payloads
+from .discord_payload import build_webhook_payload
+
 # JSON utilities
 from .json_utils import (
     SERIALIZE_ENV,
@@ -63,4 +66,6 @@ __all__ = [
     "RateLimiter",
     # Backoff
     "ExponentialBackoff",
+    # Discord webhook payloads
+    "build_webhook_payload",
 ]

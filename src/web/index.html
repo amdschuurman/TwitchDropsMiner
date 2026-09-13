@@ -409,7 +409,12 @@
                                 <button id="test-mentions-webhook-btn" class="secondary-btn" onclick="testWebhook('mentions')" style="white-space:nowrap;">Test</button>
                             </div>
                         </label>
-                        <small class="help-text-inline" id="settings-mentions-webhook-help">Fires when your username is mentioned in chat. Falls back to the Channel Points webhook above if left empty.</small>
+                        <small class="help-text-inline" id="settings-mentions-webhook-help" style="margin-bottom:10px;display:block;">Fires when your username is mentioned in chat. Falls back to the Channel Points webhook above if left empty.</small>
+                        <label>
+                            <span id="settings-ping-mention-label">Ping Mention:</span>
+                            <input type="text" id="discord-ping-mention" placeholder="&lt;@your-discord-user-id&gt;" style="width:100%;">
+                        </label>
+                        <small class="help-text-inline" id="settings-ping-mention-help">Added to every webhook message above so it pings you. Use &lt;@USER_ID&gt; for a person or &lt;@&amp;ROLE_ID&gt; for a role. Leave empty for no ping.</small>
                     </section>
 
                     <section class="settings-section">

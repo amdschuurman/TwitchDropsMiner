@@ -462,7 +462,10 @@ class Twitch:
                                             embed["thumbnail"] = {"url": drop.benefits[0].image_url}
                                         asyncio.create_task(
                                             self._message_handler_service._send_discord_webhook(
-                                                webhook_url, {"embeds": [embed]}
+                                                webhook_url,
+                                                self._message_handler_service._webhook_payload(
+                                                    [embed]
+                                                ),
                                             )
                                         )
                                     # Save to drop history

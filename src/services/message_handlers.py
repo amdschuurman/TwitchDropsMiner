@@ -20,7 +20,7 @@ from src.config import CALL, DATA_DIR, GQL_OPERATIONS, State
 from src.exceptions import GQLException, MinerException, RequestException
 from src.i18n import _
 from src.services.drop_history import save_drop_claim
-from src.utils import json_load, json_save, task_wrapper
+from src.utils import build_webhook_payload, json_load, json_save, task_wrapper
 
 _WEB_CONFIG_FILE = DATA_DIR / "web_config.json"
 
@@ -351,7 +351,7 @@ class MessageHandlerService:
                     embed["footer"] = {"text": f"Account: {_acct}"}
                 if drop.benefits:
                     embed["thumbnail"] = {"url": drop.benefits[0].image_url}
-                asyncio.create_task(self._send_discord_webhook(webhook_url, {"embeds": [embed]}))
+                asyncio.create_task(self._send_discord_webhook(webhook_url, self._webhook_payload([embed])))
 
             # Save to drop history
             save_drop_claim(
@@ -421,6 +421,18 @@ class MessageHandlerService:
         if drop is not None and drop.can_earn(self._twitch.watching_channel.get_with_default(None)):
             # the received payload is for the drop we expected
             drop.update_minutes(message["data"]["current_progress_min"])
+
+    def _webhook_payload(self, embeds: list[dict]) -> dict:
+        """Wrap embeds in the webhook body, carrying the configured ping mention.
+
+        Single entry point so every notification this service sends pings the
+        account's owner when ``discord_ping_mention`` is set, and is byte-for-byte
+        the old embeds-only body when it is not. ``src.core.client`` builds its
+        drop-claimed body through here too.
+        """
+        return build_webhook_payload(
+            embeds, getattr(self._twitch.settings, "discord_ping_mention", "")
+        )
 
     async def _send_discord_webhook(self, url: str, payload: dict) -> None:
         if not url:
@@ -510,7 +522,7 @@ class MessageHandlerService:
                     _cp_embed["footer"] = {"text": f"Account: {_acct_cp}"}
                 if _bal_after:
                     _set_last_webhook_notified(channel_login, _bal_after)
-                asyncio.create_task(self._send_discord_webhook(webhook_url, {"embeds": [_cp_embed]}))
+                asyncio.create_task(self._send_discord_webhook(webhook_url, self._webhook_payload([_cp_embed])))
             # Fetch updated balance and broadcast to UI
             await self._emit_channel_points(channel_login, channel_id, claimed_amount)
         except Exception as e:
@@ -587,7 +599,7 @@ class MessageHandlerService:
                         if _acct_gql:
                             _gql_embed["footer"] = {"text": f"Account: {_acct_gql}"}
                         _set_last_webhook_notified(channel_login, new_points)
-                        asyncio.create_task(self._send_discord_webhook(webhook_url, {"embeds": [_gql_embed]}))
+                        asyncio.create_task(self._send_discord_webhook(webhook_url, self._webhook_payload([_gql_embed])))
                 except Exception as claim_e:
                     logger.debug(f"GQL claim failed for {channel_login}: {claim_e}")
             await self._twitch.gui._broadcaster.emit("channel_points_update", {
@@ -651,7 +663,7 @@ class MessageHandlerService:
                     "color": 0x9147FF,
                     "fields": [{"name": "Channel", "value": channel_name, "inline": True}],
                 }
-                asyncio.create_task(self._send_discord_webhook(webhook_url, {"embeds": [embed]}))
+                asyncio.create_task(self._send_discord_webhook(webhook_url, self._webhook_payload([embed])))
         except Exception as e:
             logger.warning(f"Failed to claim moment {moment_id}: {e}")
 

@@ -172,6 +172,36 @@ from one IP may get flagged by Twitch; the dashboard warns about this.
 | `TDM_ALLOW_PRIVATE_WEBHOOKS` | unset | `true` allows Discord-webhook URLs that resolve to private/LAN addresses (self-hosted receivers). By default such URLs are rejected as an SSRF guard. |
 | `TZ` | UTC | Container timezone, used for timestamps in stats and alerts. |
 
+## Discord notifications
+
+Three webhook URLs and one mention string live in the Settings tab, under
+Discord Notifications, and are stored per instance in
+`<data dir>/settings.json` (mode 0600):
+
+| Setting | Fires on |
+|---|---|
+| `discord_webhook_drops` | a drop is claimed, and campaign-ending alerts |
+| `discord_webhook_points` | a channel-points chest is claimed, prediction results, the session report |
+| `discord_webhook_mentions` | your username is mentioned in chat (falls back to the points webhook) |
+| `discord_ping_mention` | not a webhook: the mention prepended to every message the three above send |
+
+A webhook that posts only `embeds` cannot notify anyone, because Discord pings
+on the `content` field and never on embed text. `discord_ping_mention` fills
+that field: set it to `<@USER_ID>` for a person or `<@&ROLE_ID>` for a role and
+every notification pings that target. Empty (the default) keeps the exact
+embeds-only body older versions sent.
+
+Every sender builds its body through `build_webhook_payload()` in
+`src/utils/discord_payload.py`, so there is one place to change and no sender
+can drift. When a mention is set the body also carries
+`allowed_mentions: {"parse": ["users", "roles"]}`, which makes the ping fire
+while keeping an `@everyone` quoted inside a chat-mention embed from pinging a
+whole server.
+
+A webhook URL is a credential: it is write-only in the dashboard's eyes,
+belongs in `settings.json` and nowhere else, and must never be pasted into a
+shell command line, a log, or a commit.
+
 ## Watch list safety
 
 An empty games-to-watch list means the miner mines nothing, and no error is

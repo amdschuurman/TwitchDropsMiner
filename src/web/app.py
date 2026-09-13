@@ -25,6 +25,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from src.auth.api_token import COOKIE_NAME, load_or_create_token
 from src.config import WATCH_INTERVAL
 
+
 _DATA_DIR = Path(os.environ.get("TDM_DATA_DIR", str(Path(__file__).parent.parent.parent / "data")))
 _WEB_CONFIG_FILE = _DATA_DIR / "web_config.json"
 _BOT_TOKEN_FILE = _DATA_DIR / "discord_bot_token.json"
@@ -724,6 +725,8 @@ class SettingsUpdate(BaseModel):
     discord_webhook_drops: str | None = None
     discord_webhook_points: str | None = None
     discord_webhook_mentions: str | None = None
+    # Not a credential: the mention string prepended to every webhook body.
+    discord_ping_mention: str | None = None
     drop_name_blacklist: list[str] | None = None
     auto_prioritize: bool | None = None
     auto_add_linked: bool | None = None
@@ -1453,7 +1456,7 @@ async def get_channel_points(channel_login: str):
 async def get_analytics_points(channel: str = "", days: int = 7):
     """Return timestamped channel points history for analytics chart."""
     days = max(1, min(days, 365))
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     ts_file = _get_account_data_dir() / "channel_points_ts.json"
     try:
         data = json.loads(ts_file.read_text()) if ts_file.exists() else {}
@@ -1686,20 +1689,32 @@ async def verify_proxy(request: ProxyVerifyRequest):
 async def test_webhook(request: Request):
     """Send a test message to a Discord webhook URL"""
     import aiohttp
+
+    from src.utils import build_webhook_payload
     body = await request.json()
     url = body.get("url", "").strip()
     if not url:
         return {"success": False, "message": "No URL provided"}
     _validate_webhook_url(url)
+    # Built through the same helper as a real notification, so the Test button
+    # also proves the configured ping mention renders.
+    mention = ""
+    if gui_manager is not None:
+        mention = gui_manager.settings.get_settings().get("discord_ping_mention", "")
+    payload = build_webhook_payload(
+        [{
+            "title": "✅ Webhook Test",
+            "description": "TwitchDropsMiner webhook is working!",
+            "color": 0x9147ff,
+        }],
+        mention,
+    )
     try:
         async with aiohttp.ClientSession() as session:
-            resp = await session.post(url, json={
-                "embeds": [{
-                    "title": "✅ Webhook Test",
-                    "description": "TwitchDropsMiner webhook is working!",
-                    "color": 0x9147ff,
-                }]
-            }, timeout=aiohttp.ClientTimeout(total=10), allow_redirects=False)
+            resp = await session.post(
+                url, json=payload,
+                timeout=aiohttp.ClientTimeout(total=10), allow_redirects=False,
+            )
             if resp.status in (200, 204):
                 return {"success": True, "message": "Sent!"}
             return {"success": False, "message": f"HTTP {resp.status}"}
@@ -2354,8 +2369,9 @@ async def remove_instance(n: int):
 @app.get("/api/predictions")
 async def get_predictions():
     """Return predictions history."""
-    from src.services.prediction_service import _get_predictions_file
     import json as _j
+
+    from src.services.prediction_service import _get_predictions_file
     p = _get_predictions_file()
     try:
         hist = _j.loads(p.read_text()) if p.exists() else []
@@ -2377,8 +2393,9 @@ class StreamerOverrideRequest(BaseModel):
 
 @app.post("/api/streamer-overrides")
 async def set_streamer_override(req: StreamerOverrideRequest):
-    from src.services.prediction_service import _get_overrides_file
     import json as _j
+
+    from src.services.prediction_service import _get_overrides_file
     p = _get_overrides_file()
     try:
         data = _j.loads(p.read_text()) if p.exists() else {}
@@ -2397,6 +2414,7 @@ async def send_session_report():
     """Build and send session report to Discord."""
     import json as _j
     from datetime import datetime, timezone
+
     from src.services.prediction_service import _get_predictions_file
     webhook = twitch_client.settings.discord_webhook_points if twitch_client else ""
     if not webhook:
@@ -2429,8 +2447,15 @@ async def send_session_report():
     ]
     embed = {"title": "📋 Session Report", "color": 0x9147FF, "fields": fields, "timestamp": datetime.now(timezone.utc).isoformat()}
     import aiohttp
+
+    from src.utils import build_webhook_payload
+    mention = getattr(twitch_client.settings, "discord_ping_mention", "") if twitch_client else ""
     async with aiohttp.ClientSession() as session:
-        await session.post(webhook, json={"embeds": [embed]}, timeout=aiohttp.ClientTimeout(total=10))
+        await session.post(
+            webhook,
+            json=build_webhook_payload([embed], mention),
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
     return {"ok": True}
 
 

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import json as _json
 
 from src.config import DATA_DIR, GQL_OPERATIONS
-from src.utils import task_wrapper
+from src.utils import build_webhook_payload, task_wrapper
 
 if TYPE_CHECKING:
     from src.core.client import Twitch
@@ -324,7 +324,14 @@ class PredictionService:
                     import aiohttp
                     try:
                         async with aiohttp.ClientSession() as session:
-                            await session.post(webhook, json={"embeds": [embed]}, timeout=aiohttp.ClientTimeout(total=10))
+                            await session.post(
+                                webhook,
+                                json=build_webhook_payload(
+                                    [embed],
+                                    getattr(self._twitch.settings, "discord_ping_mention", ""),
+                                ),
+                                timeout=aiohttp.ClientTimeout(total=10),
+                            )
                     except Exception:
                         pass
                 break

@@ -86,6 +86,10 @@ default_settings = {
     "claim_moments": True,
     "irc_chat_presence": True,
     "discord_webhook_mentions": "",
+    # Prepended to every webhook body as ``content`` so the notification pings
+    # the account's owner. Plain Discord mention markup, e.g. "<@123>" for a
+    # user or "<@&123>" for a role. Empty = embeds only, the old behaviour.
+    "discord_ping_mention": "",
     "irc_mention_notify": True,
     "make_predictions": False,
     "bet_strategy": "SMART",
@@ -532,6 +536,7 @@ class Settings:
     claim_moments: bool
     irc_chat_presence: bool
     discord_webhook_mentions: str
+    discord_ping_mention: str
     irc_mention_notify: bool
     make_predictions: bool
     bet_strategy: str

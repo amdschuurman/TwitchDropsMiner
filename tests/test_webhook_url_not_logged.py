@@ -41,6 +41,16 @@ class TestRedactSecrets(unittest.TestCase):
         out = redact_secrets(f'"discord_webhook_points": "{FAKE_WEBHOOK}"')
         self.assertNotIn(FAKE_TOKEN, out)
 
+    def test_already_safe_placeholders_survive(self):
+        # The settings manager masks by key name first, so the redactor sees a
+        # line that is already safe. Re-masking "(empty)" to "***" would throw
+        # away the only operational fact the line carries.
+        for line in (
+            "Setting changed: discord_webhook_mentions = (empty)",
+            "Setting changed: discord_webhook_mentions = ***",
+        ):
+            self.assertEqual(redact_secrets(line), line)
+
     def test_non_secret_text_is_untouched(self):
         line = "Setting changed: priority_only = True"
         self.assertEqual(redact_secrets(line), line)

@@ -42,9 +42,16 @@ _REDACTORS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
         ),
         r"\1***",
     ),
-    # A bare webhook token is still a credential when the key names it.
+    # A bare webhook token is still a credential when the key names it. The
+    # lookahead keeps an ALREADY-safe value readable: the settings manager
+    # deliberately logs ``= ***`` for a set secret and ``= (empty)`` for a
+    # cleared one, and re-masking "(empty)" to "***" would erase the one bit
+    # of operational information that line carries.
     (
-        re.compile(r"(['\"]?discord_webhook_\w*['\"]?\s*[:=]\s*['\"]?)\S+", re.IGNORECASE),
+        re.compile(
+            r"(['\"]?discord_webhook_\w*['\"]?\s*[:=]\s*['\"]?)(?!\*\*\*)(?!\(empty\))\S+",
+            re.IGNORECASE,
+        ),
         r"\1***",
     ),
 )

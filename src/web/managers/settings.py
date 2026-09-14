@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from src.config.settings import (
     MINING_BENEFIT_KEYS,
@@ -33,6 +33,43 @@ _ALLOW_EMPTY_GAMES_KEY = "allow_empty_games_to_watch"
 _ALLOW_EMPTY_BENEFITS_KEY = "allow_empty_mining_benefits"
 _EXPECTED_GAMES_KEY = "expected_games_to_watch"
 _REQUEST_ONLY_KEYS = (_ALLOW_EMPTY_GAMES_KEY, _ALLOW_EMPTY_BENEFITS_KEY, _EXPECTED_GAMES_KEY)
+
+# Keys whose VALUE is a credential. Their writes are logged by key name only:
+# the console buffer, the websocket feed, stdout and logs/TDM.log all carry
+# every "Setting changed" line, so printing one of these values leaks it into
+# four places at once (and into the host's docker json log on top). The
+# redaction filter is the second layer; this is the first, and it does not
+# depend on the value looking like anything in particular.
+_SECRET_KEY_MARKERS: Final[tuple[str, ...]] = (
+    "webhook",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "cookie",
+    "proxy",
+)
+
+
+def _is_secret_key(key: str) -> bool:
+    """True when ``key`` names a setting whose value must never be logged."""
+    lowered = key.lower()
+    return any(marker in lowered for marker in _SECRET_KEY_MARKERS)
+
+
+def _loggable_value(key: str, value: Any) -> Any:
+    """The value to put in a log line for ``key`` - masked when it is a secret.
+
+    An empty value is shown as ``(empty)`` rather than ``***`` so "the webhook
+    was cleared" stays a readable operation in the console.
+    """
+    if not _is_secret_key(key):
+        return value
+    if value in ("", None):
+        return "(empty)"
+    return "***"
 
 
 if TYPE_CHECKING:
@@ -541,12 +578,18 @@ class SettingsManager:
             self._log_rejection(key, new_value, exc)
             return False
         # Only now is the change real: value stored, side effect done.
-        self._log_change(message or f"Setting changed: {key} = {new_value}")
+        self._log_change(
+            message or f"Setting changed: {key} = {_loggable_value(key, new_value)}"
+        )
         return should_trigger_update
 
     def _log_rejection(self, key: str, new_value: Any, exc: BaseException):
         """Report a refused setting write to console and log, and mutate nothing."""
-        message = f"Setting rejected: {key} = {new_value} ({exc})"
+        # The exception text can quote the offending value, so it is masked for
+        # a secret key too - a rejected webhook write must not print the URL
+        # that was rejected.
+        detail = "***" if _is_secret_key(key) else exc
+        message = f"Setting rejected: {key} = {_loggable_value(key, new_value)} ({detail})"
         self._log_change(message)
         logger.error(message)
 

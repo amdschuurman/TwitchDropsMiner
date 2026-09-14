@@ -37,9 +37,12 @@ class TestProxySettings(unittest.TestCase):
         manager.update_settings({"proxy": proxy_url})
 
         self.assertEqual(self.mock_settings.proxy, proxy_url)
-        self.mock_console.print.assert_called_with(
-            "Setting changed: proxy = http://user:pass@localhost:8080"
-        )
+        # The value is stored in full but announced masked: a proxy URL can
+        # carry credentials (this one does), and the console line is buffered,
+        # websocket-broadcast and written to logs/TDM.log all at once.
+        self.mock_console.print.assert_called_with("Setting changed: proxy = ***")
+        printed = " ".join(str(c) for c in self.mock_console.print.call_args_list)
+        self.assertNotIn("user:pass", printed)
 
         # Test clearing a proxy
         manager.update_settings({"proxy": ""})

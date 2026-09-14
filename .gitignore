@@ -40,3 +40,7 @@ discord_bot/pairings.json
 *.bak
 venv/
 web_backup_*/
+
+# scratch / klooien folder (.claude/rules/workspace-hygiene.md section 3)
+temp/*
+!temp/README.md

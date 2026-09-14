@@ -31,13 +31,40 @@ _REDACTORS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
     (re.compile(r"(['\"]?device_code['\"]?\s*[:=]\s*['\"]?)[\w.\-]+", re.IGNORECASE), r"\1***"),
     # client_secret (defensive — TDM doesn't use one today)
     (re.compile(r"(['\"]?client_secret['\"]?\s*[:=]\s*['\"]?)[\w.\-]+", re.IGNORECASE), r"\1***"),
+    # Discord webhook URL: https://discord.com/api/webhooks/<id>/<token>
+    # The token tail IS the credential - anyone holding the full URL can post
+    # into the channel. Keep scheme/host/id so a log line stays diagnosable,
+    # mask the tail. Covers discordapp.com and the /api/v10/ form too.
+    (
+        re.compile(
+            r"(https?://(?:\w+\.)?discord(?:app)?\.com/api/(?:v\d+/)?webhooks/\d+/)[\w.\-]+",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
+    # A bare webhook token is still a credential when the key names it.
+    (
+        re.compile(r"(['\"]?discord_webhook_\w*['\"]?\s*[:=]\s*['\"]?)\S+", re.IGNORECASE),
+        r"\1***",
+    ),
 )
 
 
-def _redact(text: str) -> str:
+def redact_secrets(text: str) -> str:
+    """Return ``text`` with every known credential shape masked.
+
+    Public so non-logging sinks can reuse it. The web console buffer is one:
+    it stores and websocket-broadcasts a line BEFORE the logging handlers (and
+    therefore :class:`SecretRedactingFilter`) ever see it, so it has to redact
+    for itself.
+    """
     for pattern, repl in _REDACTORS:
         text = pattern.sub(repl, text)
     return text
+
+
+# Backwards-compatible private alias.
+_redact = redact_secrets
 
 
 class SecretRedactingFilter(logging.Filter):

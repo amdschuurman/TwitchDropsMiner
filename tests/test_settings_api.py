@@ -492,9 +492,9 @@ class TestSettingIsAnnouncedOnlyAfterItHeld(RaisingActionTestBase):
 
         self.manager.update_settings({"proxy": "http://1.2.3.4:8080"})
 
-        self.assertEqual(
-            self.console_lines(), ["Setting changed: proxy = http://1.2.3.4:8080"]
-        )
+        # ``proxy`` is a credential-shaped key, so the generic line still fires
+        # but the value is masked (see _loggable_value in the settings manager).
+        self.assertEqual(self.console_lines(), ["Setting changed: proxy = ***"])
 
 
 class TestRejectedSettingIsRolledBack(RaisingActionTestBase):

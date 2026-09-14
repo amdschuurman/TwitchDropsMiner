@@ -85,6 +85,30 @@ A webhook URL is a credential: it is write-only in the dashboard's eyes,
 belongs in `settings.json` and nowhere else, and must never be pasted into a
 shell command line, a log, or a commit.
 
+### Why a webhook value is never logged (2026-09-14)
+
+The settings manager used to announce every write as
+`Setting changed: <key> = <value>`, so saving a webhook put the full URL into
+four sinks at once: the web console ring buffer (served by `GET /api/console`),
+the `console_output` websocket event, stdout (and from there the host's docker
+json log) and `logs/TDM.log`. Both live webhooks leaked that way and had to be
+deleted and recreated. Three layers now stop it, and all three are pinned by
+`tests/test_webhook_url_not_logged.py`:
+
+1. `src/web/managers/settings.py` masks by KEY NAME. `_is_secret_key()` matches
+   `webhook`, `token`, `secret`, `password`, `api_key`, `cookie`, `proxy`; those
+   keys log `= ***` (or `= (empty)` when cleared), on the accepted and the
+   rejected path, and a rejection hides the exception text too since it can
+   quote the value.
+2. `src/web/managers/console.py` redacts every line BEFORE it is buffered, so
+   the dashboard buffer and the websocket feed are covered even though they
+   never pass through a logging handler.
+3. `src/utils/log_redaction.py` carries the URL pattern itself, for any line
+   that comes from somewhere else entirely.
+
+Adding a new credential-shaped setting means adding its word to
+`_SECRET_KEY_MARKERS`, not remembering not to print it.
+
 ## Project Overview
 
 Twitch Drops Miner is a Python application that automatically mines timed Twitch drops without downloading stream data. It uses Twitch's GraphQL API and websocket connections to simulate watching streams while tracking drop progress.

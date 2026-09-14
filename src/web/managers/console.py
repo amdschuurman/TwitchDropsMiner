@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 
 import logging
 
+from src.utils.log_redaction import redact_secrets
+
 
 logger = logging.getLogger("TwitchDrops")
 
@@ -32,9 +34,17 @@ class ConsoleOutputManager:
     def print(self, message: str):
         """Print a message to the console output with timestamp.
 
+        The line is redacted BEFORE it is buffered. This buffer is served
+        verbatim by ``GET /api/console`` and broadcast over the
+        ``console_output`` websocket event, neither of which passes through
+        the logging handlers that carry :class:`SecretRedactingFilter`, so
+        without this call a credential printed here would reach the dashboard
+        and the log file even when the filter is installed.
+
         Args:
             message: The message to display
         """
+        message = redact_secrets(message)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] | {message}"
         self._buffer.append(line)

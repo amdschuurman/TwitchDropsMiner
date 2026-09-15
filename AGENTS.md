@@ -55,6 +55,27 @@ canonical copy anywhere else** - not in this repo, not in the novaren repo, not
 in a password manager entry. Lost one? Delete the webhook in Discord and make a
 new one.
 
+## Editing settings.json on CT203: stop the container FIRST (2026-09-15)
+
+A clean shutdown is the last thing the miner does before exit and it SAVES its
+in-memory settings over `settings.json` (`src/__main__.py`, "Saving application
+state"). An edit made to the file while the container runs is therefore undone
+by the very restart meant to apply it. That is exactly what happened on
+2026-09-15 01:18: `discord_webhook_points` was blanked on both accounts, both
+containers were restarted one second later, and the shutdown save wrote the old
+webhook straight back, byte for byte. Channel-points posts kept coming.
+
+The only safe order is `docker compose stop <container>`, edit the file, then
+`docker compose start <container>`. Prove the change afterwards from the RUNNING
+process, not the file: `GET /api/settings` from inside the container with its own
+`WEB_PASSWORD` (port 8080 for miner 1, 8082 for miner 2), masking webhook values.
+
+Live notification policy (owner decision 2026-09-15, both accounts identical):
+only `discord_webhook_drops` and `discord_webhook_mentions` are set;
+`discord_webhook_points` is EMPTY, which silences channel-points chests,
+moments, prediction results and the session report while the claiming itself
+keeps running. `campaign_end_alerts_enabled=false` in `web_config.json`.
+
 ## Discord notifications
 
 Three webhook URLs and one mention string live in the Settings tab, under

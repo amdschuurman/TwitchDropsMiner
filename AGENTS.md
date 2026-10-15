@@ -46,7 +46,7 @@ is disabled on this host, so the pull is manual:
 Discord notifications go to `#twitch-drops` in the Family Schuurman guild, one
 webhook per account, named `Twitch Drops ✦ amdschuurman` and
 `Twitch Drops ✦ Enfinomori`, both created with the Novaren bot
-(`Projecten/novaren/`). Each instance's `discord_webhook_drops`,
+(`Home/novaren/`). Each instance's `discord_webhook_drops`,
 `discord_webhook_points` and `discord_webhook_mentions` all point at that
 account's own webhook, and `discord_ping_mention` holds the owner's user
 mention so the message pings them. **The webhook URLs live in exactly one

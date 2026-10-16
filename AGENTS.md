@@ -37,6 +37,19 @@ memory still naming that path is stale.
 |---|---|---|---|
 | `twitch-drops-miner` | amdschuurman | 8113 | `/opt/twitchdrops/data` |
 | `twitch-drops-miner-2` | Enfinomori | 8114 | `/opt/twitchdrops/data2` |
+| `twitch-drops-miner-3` | friend's account (not logged in yet, container stopped) | 8115 | `/opt/twitchdrops/data3` |
+
+Account tabs come from `/opt/twitchdrops/instances.json`, bind-mounted read-only into
+every miner at `/app/instances.json` (2026-10-16); without it the code falls back to a
+hardcoded list of two. Each `/accN` path is a custom location on NPM proxy host 13
+(lxc-ingress), forwarding to `192.168.1.83:<host port>` with the prefix stripped.
+
+**Fresh Twitch logins are broken upstream (since late 2026-09).** `POST
+id.twitch.tv/oauth2/device` answers `400 invalid client` for the ANDROID_APP and WEB
+client ids, so a new account crash-loops on `KeyError: 'device_code'` (DevilXD issue
+#1165). Saved sessions keep working. SMARTBOX still gets a code but returns no
+campaigns. The working route is SimpliAj 1.8.x (2026-10-14): a `login-helper.py` run on
+a desktop with real Chrome, which uploads the session plus an integrity token.
 
 Release flow: push to `main` runs `.github/workflows/docker-release.yml`, which
 publishes `ghcr.io/amdschuurman/twitchdropsminer:latest` (multi-arch). Watchtower

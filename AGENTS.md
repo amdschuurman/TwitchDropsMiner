@@ -37,7 +37,7 @@ memory still naming that path is stale.
 |---|---|---|---|
 | `twitch-drops-miner` | amdschuurman | 8113 | `/opt/twitchdrops/data` |
 | `twitch-drops-miner-2` | Enfinomori | 8114 | `/opt/twitchdrops/data2` |
-| `twitch-drops-miner-3` | friend's account (not logged in yet, container stopped) | 8115 | `/opt/twitchdrops/data3` |
+| `twitch-drops-miner-3` | friend's account, runs **SimpliAj 1.8.2** (pinned), not our image | 8115 | `/opt/twitchdrops/data3` |
 
 Account tabs come from `/opt/twitchdrops/instances.json`, bind-mounted read-only into
 every miner at `/app/instances.json` (2026-10-16); without it the code falls back to a
@@ -50,6 +50,23 @@ client ids, so a new account crash-loops on `KeyError: 'device_code'` (DevilXD i
 #1165). Saved sessions keep working. SMARTBOX still gets a code but returns no
 campaigns. The working route is SimpliAj 1.8.x (2026-10-14): a `login-helper.py` run on
 a desktop with real Chrome, which uploads the session plus an integrity token.
+
+Account 3 therefore runs SimpliAj's own image (`gitsimpliaj/twitch-drops-miner:1.8.2`),
+so accounts 1 and 2 keep their working Android sessions on our fork. Its login is the
+helper, run on any PC with Python 3 and Chrome or Edge:
+`python -c "import urllib.request as u;exec(u.urlopen('https://twitchdrops.amdschuurman.nl/acc3/login-helper.py').read())" https://twitchdrops.amdschuurman.nl/acc3`
+After login the server mints a Client-Integrity token in its own Chrome under Xvfb
+(proven on CT203 2026-10-16). Access control for account 3:
+- SimpliAj reads its password from `data3/web_config.json` (`password`, plain text),
+  NOT from `WEB_PASSWORD` once `setup_done` is true. The same value is in
+  `/opt/twitchdrops/acc3.env` (mode 600). Its socket.io is NOT password-checked, so the
+  LAN port 8115 exposes live state; the public path is gated (below).
+- NPM host 13: server-level `location = /__tdm_gate` asks miner 1's `/api/auth/status`
+  (401 without our `tdm_session` cookie). `/acc3` uses `auth_request /__tdm_gate` and then
+  injects `X-Fleet-Password`. Two exceptions skip the gate: `/acc3/login-helper.py`
+  (public code) and `/acc3/api/login/browser/helper-session` (password injected; it
+  answers 409 unless account 3 is waiting for a login, so it is only usable while that
+  account is logged out). Both live in the DB `locations` JSON and `13.conf`.
 
 Release flow: push to `main` runs `.github/workflows/docker-release.yml`, which
 publishes `ghcr.io/amdschuurman/twitchdropsminer:latest` (multi-arch). Watchtower
